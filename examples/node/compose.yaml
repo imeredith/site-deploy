@@ -1,0 +1,31 @@
+x-site-deploy:
+  domain: node.localhost
+  service: web
+  port: 8080
+  idle_timeout: 5m
+  start_timeout: 60s
+  suspend_mode: stop
+
+services:
+  web:
+    image: node:24-bookworm-slim
+    command: [node, /app/server.js]
+    init: true
+    read_only: true
+    environment:
+      PORT: "8080"
+      DATA_DIR: /data
+    volumes:
+      - ./server.js:/app/server.js:ro
+      - data:/data
+    cpus: 0.5
+    mem_limit: 128m
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:8080/healthz').then(r => { if (!r.ok) process.exit(1); }).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  data: {}

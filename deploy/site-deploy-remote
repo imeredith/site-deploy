@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Deprecated: site-deploy opens SSH tunnels itself now. Configure servers with
+# `site-deploy host add` and pick one with `site-deploy host use NAME` or
+# `site-deploy --host NAME`.
+#
+# Kept so scripts written for it keep working unchanged: it runs site-deploy
+# against the server in ~/.config/site-deploy/remote.env, whichever host is
+# current.
+#
+#   SITE_DEPLOY_SSH            SSH target running the daemon (required)
+#   SITE_DEPLOY_TOKEN_FILE     local copy of the daemon token (default ~/.config/site-deploy/token)
+#   SITE_DEPLOY_REGISTRY_PORT  registry port on the server (default 9082)
+#   SITE_DEPLOY_RSH            remote shell, like rsync's -e (default ssh)
+#   SITE_DEPLOY_SSH_CONFIG     ssh_config file to use instead of ~/.ssh/config
+#   SITE_DEPLOY_CLI            CLI executable (default: site-deploy on PATH)
+set -euo pipefail
+
+config=${SITE_DEPLOY_REMOTE_CONFIG:-$HOME/.config/site-deploy/remote.env}
+if [ -f "$config" ]; then
+	# shellcheck source=/dev/null
+	. "$config"
+fi
+: "${SITE_DEPLOY_SSH:?set SITE_DEPLOY_SSH or create $config}"
+export SITE_DEPLOY_SSH
+export SITE_DEPLOY_TOKEN_FILE=${SITE_DEPLOY_TOKEN_FILE:-$HOME/.config/site-deploy/token}
+if [ -n "${SITE_DEPLOY_SSH_CONFIG:-}" ]; then
+	SITE_DEPLOY_RSH="${SITE_DEPLOY_RSH:-ssh} -F '$SITE_DEPLOY_SSH_CONFIG'"
+fi
+for name in SITE_DEPLOY_REGISTRY_PORT SITE_DEPLOY_RSH; do
+	if [ -n "${!name:-}" ]; then export "${name?}"; fi
+done
+unset SITE_DEPLOY_HOST SITE_DEPLOY_SERVER
+exec "${SITE_DEPLOY_CLI:-site-deploy}" "$@"

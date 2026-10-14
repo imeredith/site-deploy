@@ -1,0 +1,71 @@
+name: site-deploy
+description: Deploy a Compose bundle to a site-deploy server over SSH, optionally pushing images to its registry first.
+author: Ivan Meredith
+
+inputs:
+  host:
+    description: SSH destination of the server running the daemon, such as deploy@example.com or ssh://deploy@example.com:2222.
+    required: true
+  ssh-key:
+    description: Private key for that SSH user. Store it as a secret.
+    required: true
+  known-hosts:
+    description: The server's known_hosts lines (from ssh-keyscan run somewhere you trust). Unknown host keys are refused.
+    required: true
+  token:
+    description: The daemon's API token. Store it as a secret.
+    required: true
+  name:
+    description: Application to deploy. Leave empty to only install site-deploy and its configuration for later steps.
+    required: false
+    default: ""
+  bundle:
+    description: Bundle directory, packaged with the skill's bundle.sh, or a ready ZIP.
+    required: false
+    default: "."
+  replace:
+    description: When the application already exists, delete it and deploy again (brief downtime; named volumes survive). When false, an existing application fails the step.
+    required: false
+    default: "true"
+  push:
+    description: Local images to push to the server's registry before deploying, one "LOCAL_IMAGE NAME:TAG" per line.
+    required: false
+    default: ""
+  registry-port:
+    description: Registry port on the server.
+    required: false
+    default: "9082"
+
+outputs:
+  domain:
+    description: Domain of the deployed application.
+    value: ${{ steps.run.outputs.domain }}
+
+runs:
+  using: composite
+  steps:
+    # Any Go from 1.21 on fetches the toolchain go.mod asks for, so a runner's
+    # own Go is enough and stays the one later steps see.
+    - id: go
+      shell: bash
+      run: |
+        minor=$(go env GOVERSION 2>/dev/null | sed -nE 's/^go1\.([0-9]+).*/\1/p')
+        if [ "${minor:-0}" -ge 21 ]; then echo found=true >> "$GITHUB_OUTPUT"; fi
+    - if: steps.go.outputs.found != 'true'
+      uses: actions/setup-go@v7
+      with:
+        go-version: stable
+        cache: false
+    - id: run
+      shell: bash
+      env:
+        INPUT_HOST: ${{ inputs.host }}
+        INPUT_SSH_KEY: ${{ inputs.ssh-key }}
+        INPUT_KNOWN_HOSTS: ${{ inputs.known-hosts }}
+        INPUT_TOKEN: ${{ inputs.token }}
+        INPUT_NAME: ${{ inputs.name }}
+        INPUT_BUNDLE: ${{ inputs.bundle }}
+        INPUT_REPLACE: ${{ inputs.replace }}
+        INPUT_PUSH: ${{ inputs.push }}
+        INPUT_REGISTRY_PORT: ${{ inputs.registry-port }}
+      run: '"$GITHUB_ACTION_PATH/deploy/github-action.sh"'

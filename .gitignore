@@ -1,0 +1,5 @@
+/bin/
+/.site-deploy/
+*.zip
+coverage.out
+CLAUDE.local.md

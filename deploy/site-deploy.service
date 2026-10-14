@@ -1,0 +1,28 @@
+[Unit]
+Description=ZIP application deployment orchestrator
+Requires=docker.service
+Wants=network-online.target
+After=docker.service network-online.target
+# If enabling --caddy-admin below, also order this unit after your dedicated
+# Caddy service and ensure that its loopback admin API is already listening.
+
+[Service]
+Type=simple
+User=site-deploy
+Group=site-deploy
+SupplementaryGroups=docker
+StateDirectory=site-deploy
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/site-deploy
+ExecStart=/usr/local/bin/site-deploy serve --data-dir /var/lib/site-deploy
+# Optional for a dedicated Caddy instance: append
+# --caddy-admin http://127.0.0.1:2019 to ExecStart; it replaces the whole config.
+# To let applications bind-mount host directories, append one
+# --host-path [APP,...=]PATH[:rw] per directory (README, "Host paths").
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

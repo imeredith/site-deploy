@@ -1,0 +1,15 @@
+x-site-deploy:
+  domain: hello.localhost
+  service: web
+  port: 80
+  idle_timeout: 5m
+  start_timeout: 60s
+  suspend_mode: stop
+
+services:
+  web:
+    image: nginx:alpine
+    volumes:
+      - ./public:/usr/share/nginx/html:ro
+    cpus: 0.5
+    mem_limit: 128m
