@@ -328,6 +328,51 @@ func TestCLISendsVersionAndChecksDaemonVersion(t *testing.T) {
 	}
 }
 
+func TestCLICopyVolumesNeedsADaemonThatSupportsIt(t *testing.T) {
+	cliTestEnvironment(t)
+	zipPath := filepath.Join(t.TempDir(), "bundle.zip")
+	if err := os.WriteFile(zipPath, []byte("PK\x03\x04zip"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	daemon, deployed := "", ""
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/version":
+			fmt.Fprintf(w, `{"version":%q}`, daemon)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/apps/preview":
+			deployed = r.URL.RawQuery
+			io.WriteString(w, `{"name":"preview","state":"running","spec":{"domain":"preview.example"}}`)
+		default:
+			t.Errorf("request = %s %s", r.Method, r.URL)
+		}
+	}))
+	defer server.Close()
+	deploy := func() (int, string, string) {
+		return cliTestRun("deploy", "preview", zipPath, "--copy-volumes-from", "main", "--token", cliTestToken, "--server", server.URL)
+	}
+	daemon = "0.6.1"
+	if code, _, stderr := deploy(); code != 1 || !strings.Contains(stderr, "needs daemon 0.7.0 or newer, and this one is 0.6.1") || deployed != "" {
+		t.Fatalf("old daemon: code=%d stderr=%q deployed=%q", code, stderr, deployed)
+	}
+	for _, daemon = range []string{"0.7.0", "dev"} {
+		deployed = ""
+		code, stdout, stderr := deploy()
+		if code != 0 || deployed != "copy_volumes_from=main" || !strings.Contains(stdout, "preview: running") || !strings.Contains(stderr, "Copying named volumes from main") {
+			t.Fatalf("daemon %s: code=%d stdout=%q stderr=%q deployed=%q", daemon, code, stdout, stderr, deployed)
+		}
+	}
+	for _, args := range [][]string{
+		{"list", "--copy-volumes-from", "main"},
+		{"deploy", "main", zipPath, "--copy-volumes-from", "main"},
+		{"deploy", "preview", zipPath, "--copy-volumes-from", "Main"},
+		{"deploy", "preview", zipPath, "--copy-volumes-from"},
+	} {
+		if code, _, _ := cliTestRun(args...); code != 2 {
+			t.Errorf("%q: code=%d, want 2", args, code)
+		}
+	}
+}
+
 func TestCLIListShowsAccess(t *testing.T) {
 	cliTestEnvironment(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

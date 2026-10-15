@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -117,13 +118,16 @@ func TestNamespacedDockerCaddyLifecycle(t *testing.T) {
 			t.Errorf("cleanup test volume: %v %s", err, output)
 		}
 	}()
-	archivePath := filepath.Join(root, "upload.zip")
-	writeArchive(t, archivePath, map[string]string{
-		"compose.yaml": fmt.Sprintf("x-site-deploy:\n  domain: %s\n  service: web\n  port: 8080\n  idle_timeout: 1s\n  start_timeout: 60s\nservices:\n  web:\n    image: %s\n    restart: always\n    command: [node, /app/server.js]\n    volumes: [\".:/app\", \"data:/data\", \"%s:/host:ro\"]\n    cpus: 0.25\n    mem_limit: 128m\nvolumes:\n  data: {}\n", domain, image, hostDir),
-		"server.js": `const http = require('http'); const fs = require('fs');
+	appFiles := func(domain string) map[string]string {
+		return map[string]string{
+			"compose.yaml": fmt.Sprintf("x-site-deploy:\n  domain: %s\n  service: web\n  port: 8080\n  idle_timeout: 1s\n  start_timeout: 60s\nservices:\n  web:\n    image: %s\n    restart: always\n    command: [node, /app/server.js]\n    volumes: [\".:/app\", \"data:/data\", \"%s:/host:ro\"]\n    cpus: 0.25\n    mem_limit: 128m\nvolumes:\n  data: {}\n", domain, image, hostDir),
+			"server.js": `const http = require('http'); const fs = require('fs');
 fs.writeFileSync('/app/compose.generated.json', 'This application file must never be executed as Compose configuration.');
 http.createServer((req,res)=>{if(req.url==='/host'){res.end(fs.readFileSync('/host/greeting','utf8'));return;}if(req.url==='/stream'){res.writeHead(200,{'Content-Type':'text/plain'});res.write('start\n');setTimeout(()=>res.end('end\n'),1800);return;}let body='';req.on('data',chunk=>body+=chunk);req.on('end',()=>{const file='/data/count';let count=fs.existsSync(file)?Number(fs.readFileSync(file,'utf8')):0;fs.writeFileSync(file,String(++count));res.setHeader('Content-Type','application/json');res.end(JSON.stringify({count,body,host:req.headers.host,uri:req.url}));});}).listen(8080,'0.0.0.0');process.on('SIGTERM',()=>process.exit(0));`,
-	})
+		}
+	}
+	archivePath := filepath.Join(root, "upload.zip")
+	writeArchive(t, archivePath, appFiles(domain))
 	command := func(args ...string) string {
 		t.Helper()
 		var stdout, stderr bytes.Buffer
@@ -162,7 +166,7 @@ http.createServer((req,res)=>{if(req.url==='/host'){res.end(fs.readFileSync('/ho
 		}
 		address = listener.Addr().String()
 		listener.Close()
-		config, err := caddy.Config(sites, strings.TrimPrefix(proxy.URL, "http://"), true)
+		config, err := caddy.Config(sites, strings.TrimPrefix(proxy.URL, "http://"), caddy.HTTP)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -380,6 +384,79 @@ http.createServer((req,res)=>{if(req.url==='/host'){res.end(fs.readFileSync('/ho
 	}
 	command("resume", namespace)
 	command("logs", namespace, "--tail", "5")
+	// A second application starts with a copy of the first one's data volume,
+	// which keeps serving afterwards, and the two then diverge. Requests go
+	// through the gateway, which wakes applications the idle scan suspends.
+	count := func(host string) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, proxy.URL+"/", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = host
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var result struct{ Count int }
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatal(err)
+		}
+		return result.Count
+	}
+	copyName := namespace + "-copy"
+	copyProject := strings.TrimSpace(string(prefix)) + copyName
+	// The idle scan may be stopping the copy, which makes delete refuse.
+	deleteCopy := func(ctx context.Context) error {
+		for {
+			err := m.Delete(ctx, copyName)
+			if !errors.Is(err, orchestrator.ErrBusy) {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return err
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}
+	defer func() {
+		cleanupCtx, stop := context.WithTimeout(context.Background(), 60*time.Second)
+		defer stop()
+		if _, err := m.Get(copyName); err == nil {
+			if err := deleteCopy(cleanupCtx); err != nil {
+				t.Errorf("cleanup copy deployment: %v", err)
+			}
+		}
+		if output, err := docker("volume", "rm", copyProject+"_data"); err != nil && !strings.Contains(string(output), "no such volume") {
+			t.Errorf("cleanup copy volume: %v %s", err, output)
+		}
+	}()
+	before := count(domain)
+	copyArchive := filepath.Join(root, "copy.zip")
+	writeArchive(t, copyArchive, appFiles(copyName+".localhost"))
+	command("deploy", copyName, copyArchive, "--copy-volumes-from", namespace)
+	copied, err := m.Get(copyName)
+	if err != nil || copied.State != model.StateRunning {
+		t.Fatalf("copy deployment: %+v %v", copied, err)
+	}
+	if got := count(copyName + ".localhost"); got != before+1 {
+		t.Fatalf("copy counted %d, want %d", got, before+1)
+	}
+	if got := count(domain); got != before+1 {
+		t.Fatalf("source counted %d after copy, want %d", got, before+1)
+	}
+	// The volume outlives delete, and a copy never replaces it.
+	deleteCtx, stopDelete := context.WithTimeout(context.Background(), 60*time.Second)
+	defer stopDelete()
+	if err := deleteCopy(deleteCtx); err != nil {
+		t.Fatalf("delete copy: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := cli.Run([]string{"--server", control.URL, "--token", token, "deploy", copyName, copyArchive, "--copy-volumes-from", namespace}, &stdout, &stderr); code == 0 || !strings.Contains(stderr.String(), "already exists, kept from an earlier deployment") {
+		t.Fatalf("copy over a kept volume: exit %d: %s", code, stderr.String())
+	}
 	// Deleting, as a redeploy does, breaks an open stream instead of refusing.
 	open, err := request("/stream", "")
 	if err != nil {
@@ -402,7 +479,7 @@ http.createServer((req,res)=>{if(req.url==='/host'){res.end(fs.readFileSync('/ho
 	if output, err := docker("volume", "inspect", project+"_data"); err != nil {
 		t.Fatalf("delete did not preserve named volume: %v %s", err, output)
 	}
-	t.Log("verified ZIP upload, writable-bundle/control isolation, project namespace, restart/resource settings, exact queries, crash recovery, Caddy proxy, concurrent cold POSTs, volume persistence, read-only host path mount, stream protection, idle stop, basic auth without wake-up, resume, logs, and deletion breaking an open stream")
+	t.Log("verified ZIP upload, writable-bundle/control isolation, project namespace, restart/resource settings, exact queries, crash recovery, Caddy proxy, concurrent cold POSTs, volume persistence, copying volumes to a new deployment, read-only host path mount, stream protection, idle stop, basic auth without wake-up, resume, logs, and deletion breaking an open stream")
 }
 
 func writeArchive(t *testing.T, path string, files map[string]string) {

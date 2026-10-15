@@ -13,14 +13,18 @@ update `SKILL.md`, `references/bundle-format.md` and `scripts/bundle.sh` in the 
 
 ## Releasing / upgrading
 
-- Bump `VERSION` (semver) for any change you install. `deploy/upgrade.sh` refuses same-or-older versions without `--force`.
+- Bump `VERSION` (semver) for any change you install. `site-deploy upgrade` installs only a newer version than the host's,
+  and refuses a CLI older than the repository's `VERSION` on `main`, unless `--force`.
 - The GitHub Action (`action.yml`, README "GitHub Actions") builds the CLI from the ref workflows use, normally `main`.
-  Push to GitHub before upgrading a daemon that CI deploys to, or those workflows get HTTP 426.
+  Push to GitHub before upgrading a daemon that CI deploys to, or those workflows get HTTP 426. `upgrade` warns when the
+  CLI is newer than the repository.
 - `make check` (tests + vet) before releasing. For engine/Compose changes, also run the Docker integration test on
   the server (see README "Scope and validation"); it is safe there because it namespaces and cleans up its own resources.
-- `deploy/upgrade.sh HOST` builds, upgrades the local CLI **first**, then installs on the host, built for its
-  architecture. On the host it backs up `/var/lib/site-deploy`, switches the release symlink, and verifies the new
-  version is running. It rolls back automatically if not.
+- `make upgrade HOST=NAME` runs `make install-cli` (the CLI plus Linux server builds for amd64 and arm64), then
+  `site-deploy upgrade NAME`, which installs the CLI's own version on the host, for its architecture, so the CLI is
+  always upgraded first. On the host `deploy/install-host.sh` (embedded in the CLI) backs up `/var/lib/site-deploy`,
+  switches the release symlink, and verifies the new version is running. It rolls back automatically if not.
+  `site-deploy upgrade NAME --check` reports the versions without changing anything.
 - Compatibility contract: a release daemon rejects CLIs older than itself (HTTP 426). New CLIs must keep working against
   older daemons, so gate new endpoints/params on the daemon version (the API rejects unknown query params).
 - Persisted-state changes: bump `store.DataFormat` and add the migration in `Store.CheckFormat`. Older daemons refuse

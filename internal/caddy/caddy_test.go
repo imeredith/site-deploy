@@ -56,7 +56,7 @@ type config struct {
 
 func TestConfigRestrictsDomainsAndEnablesHTTPS(t *testing.T) {
 	domains := []string{"z.example", "A.example.", "a.example"}
-	data, err := caddy.Config(publicSites(domains...), "127.0.0.1:9080", false)
+	data, err := caddy.Config(publicSites(domains...), "127.0.0.1:9080", caddy.HTTPS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,15 +78,112 @@ func TestConfigRestrictsDomainsAndEnablesHTTPS(t *testing.T) {
 	if !reflect.DeepEqual(domains, []string{"z.example", "A.example.", "a.example"}) {
 		t.Fatal("input domains mutated")
 	}
-	second, err := caddy.Config(publicSites("a.example", "z.example"), "127.0.0.1:9080", false)
+	second, err := caddy.Config(publicSites("a.example", "z.example"), "127.0.0.1:9080", caddy.HTTPS)
 	if err != nil || string(second) != string(data) {
 		t.Fatal("equivalent configurations are not deterministic")
 	}
 }
 
+func TestInternalHTTPSUsesLocalCA(t *testing.T) {
+	data, err := caddy.Config(publicSites("app.example"), "127.0.0.1:9080", caddy.InternalHTTPS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		Apps struct {
+			HTTP struct {
+				Servers map[string]struct {
+					Listen         []string        `json:"listen"`
+					AutomaticHTTPS json.RawMessage `json:"automatic_https"`
+				} `json:"servers"`
+			} `json:"http"`
+			TLS struct {
+				Automation struct {
+					Policies []struct {
+						Subjects []string `json:"subjects"`
+						Issuers  []struct {
+							Module string `json:"module"`
+						} `json:"issuers"`
+					} `json:"policies"`
+				} `json:"automation"`
+			} `json:"tls"`
+			PKI struct {
+				CertificateAuthorities map[string]struct {
+					InstallTrust *bool `json:"install_trust"`
+				} `json:"certificate_authorities"`
+			} `json:"pki"`
+		} `json:"apps"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	server := cfg.Apps.HTTP.Servers["site-deploy"]
+	if !reflect.DeepEqual(server.Listen, []string{":443"}) || server.AutomaticHTTPS != nil {
+		t.Fatalf("internal HTTPS does not keep automatic HTTPS on port 443: %s", data)
+	}
+	policies := cfg.Apps.TLS.Automation.Policies
+	// A policy without subjects covers every domain, so none falls back to ACME.
+	if len(policies) != 1 || len(policies[0].Subjects) != 0 || len(policies[0].Issuers) != 1 || policies[0].Issuers[0].Module != "internal" {
+		t.Fatalf("certificates are not issued only by the local CA: %s", data)
+	}
+	local, ok := cfg.Apps.PKI.CertificateAuthorities["local"]
+	if !ok || local.InstallTrust == nil || *local.InstallTrust {
+		t.Fatalf("local CA tries to install its root: %s", data)
+	}
+
+	public, err := caddy.Config(publicSites("app.example"), "127.0.0.1:9080", caddy.HTTPS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(public), `"tls"`) || strings.Contains(string(public), `"pki"`) {
+		t.Fatalf("public HTTPS overrides Caddy's default issuers: %s", public)
+	}
+	if _, err := caddy.Config(nil, "127.0.0.1:9080", caddy.Mode(99)); err == nil {
+		t.Fatal("accepted an unknown mode")
+	}
+}
+
+func TestCertificateFoldersAreLoaded(t *testing.T) {
+	type tlsApp struct {
+		Apps struct {
+			TLS *struct {
+				Certificates struct {
+					LoadFolders []string `json:"load_folders"`
+				} `json:"certificates"`
+				Automation *json.RawMessage `json:"automation"`
+			} `json:"tls"`
+		} `json:"apps"`
+	}
+	for _, mode := range []caddy.Mode{caddy.HTTPS, caddy.InternalHTTPS} {
+		data, err := caddy.Config(publicSites("app.example"), "127.0.0.1:9080", mode, "/data/certs")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var cfg tlsApp
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Apps.TLS == nil || !reflect.DeepEqual(cfg.Apps.TLS.Certificates.LoadFolders, []string{"/data/certs"}) {
+			t.Fatalf("mode %d does not load the folder: %s", mode, data)
+		}
+		// Names the folder does not cover still get certificates as the mode says.
+		if (cfg.Apps.TLS.Automation != nil) != (mode == caddy.InternalHTTPS) {
+			t.Fatalf("mode %d changed its issuers: %s", mode, data)
+		}
+	}
+	if _, err := caddy.Config(nil, "127.0.0.1:9080", caddy.HTTP, "/data/certs"); err == nil {
+		t.Fatal("accepted certificate folders over plain HTTP")
+	}
+	for _, folder := range []string{"certs", "/data/../certs", "/data/certs/", ""} {
+		if _, err := caddy.Config(nil, "127.0.0.1:9080", caddy.HTTPS, folder); err == nil {
+			t.Fatalf("accepted certificate folder %q", folder)
+		}
+	}
+}
+
 func TestEmptyConfigCannotForwardCatchall(t *testing.T) {
-	for _, httpOnly := range []bool{false, true} {
-		data, err := caddy.Config(nil, "[::1]:9080", httpOnly)
+	for _, mode := range []caddy.Mode{caddy.HTTPS, caddy.InternalHTTPS, caddy.HTTP} {
+		data, err := caddy.Config(nil, "[::1]:9080", mode)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -98,7 +195,7 @@ func TestEmptyConfigCannotForwardCatchall(t *testing.T) {
 		if len(server.Routes) != 1 || len(server.Routes[0].Match) != 0 || server.Routes[0].Handle[0].Handler != "static_response" || server.Routes[0].Handle[0].StatusCode != 404 || strings.Contains(string(data), "reverse_proxy") {
 			t.Fatalf("empty config can forward a request: %s", data)
 		}
-		if httpOnly && (!reflect.DeepEqual(server.Listen, []string{":80"}) || server.AutomaticHTTPS == nil || !server.AutomaticHTTPS.Disable) {
+		if mode == caddy.HTTP && (!reflect.DeepEqual(server.Listen, []string{":80"}) || server.AutomaticHTTPS == nil || !server.AutomaticHTTPS.Disable) {
 			t.Fatalf("HTTP development mode is not explicit: %s", data)
 		}
 	}
@@ -106,12 +203,12 @@ func TestEmptyConfigCannotForwardCatchall(t *testing.T) {
 
 func TestConfigRejectsUnsafeInputs(t *testing.T) {
 	for _, address := range []string{"", "localhost:9080", "0.0.0.0:9080", "192.0.2.3:9080", "127.0.0.1", "127.0.0.1:0", "127.0.0.1:65536", "127.0.0.1:+80", "http://127.0.0.1:9080", "unix//tmp/gateway.sock", "[::]:9080"} {
-		if _, err := caddy.Config(publicSites("app.example"), address, false); err == nil {
+		if _, err := caddy.Config(publicSites("app.example"), address, caddy.HTTPS); err == nil {
 			t.Errorf("accepted unsafe gateway address %q", address)
 		}
 	}
 	for _, domain := range []string{"", "*.example", "a.example:80", "https://a.example", "a.example/path", "a..example", "-a.example", "a_.example", "a.example ", "127.0.0.1"} {
-		if _, err := caddy.Config(publicSites(domain), "127.0.0.1:9080", false); err == nil {
+		if _, err := caddy.Config(publicSites(domain), "127.0.0.1:9080", caddy.HTTPS); err == nil {
 			t.Errorf("accepted invalid application domain %q", domain)
 		}
 	}
@@ -125,7 +222,7 @@ func TestProtectedSitesAuthenticateBeforeProxying(t *testing.T) {
 		{Domain: "Private.Example.", BasicAuth: []model.BasicAuthUser{{User: "preview", Hash: testHash}, {User: "alice", Hash: testHash}}},
 		{Domain: "another.example", BasicAuth: []model.BasicAuthUser{{User: "bob", Hash: testHash}}},
 	}
-	data, err := caddy.Config(sites, "127.0.0.1:9080", true)
+	data, err := caddy.Config(sites, "127.0.0.1:9080", caddy.HTTP)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,12 +291,12 @@ func TestProtectedSitesAuthenticateBeforeProxying(t *testing.T) {
 		{User: "has:colon", Hash: testHash},
 		{User: "", Hash: testHash},
 	} {
-		if _, err := caddy.Config([]model.Site{{Domain: "x.example", BasicAuth: []model.BasicAuthUser{account}}}, "127.0.0.1:9080", true); err == nil {
+		if _, err := caddy.Config([]model.Site{{Domain: "x.example", BasicAuth: []model.BasicAuthUser{account}}}, "127.0.0.1:9080", caddy.HTTP); err == nil {
 			t.Errorf("accepted invalid account %+v", account)
 		}
 	}
 	repeated := []model.Site{{Domain: "x.example"}, {Domain: "X.example", BasicAuth: []model.BasicAuthUser{{User: "a", Hash: testHash}}}}
-	if _, err := caddy.Config(repeated, "127.0.0.1:9080", true); err == nil {
+	if _, err := caddy.Config(repeated, "127.0.0.1:9080", caddy.HTTP); err == nil {
 		t.Error("accepted a domain that is both public and protected")
 	}
 }

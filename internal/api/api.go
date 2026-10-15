@@ -217,13 +217,23 @@ func (h *handler) deploy(w http.ResponseWriter, r *http.Request, name string) {
 		h.error(w, http.StatusUnsupportedMediaType, errors.New("deployment body must use Content-Type: application/zip"))
 		return
 	}
+	values, err := query(r, "copy_volumes_from")
+	if err != nil {
+		h.error(w, http.StatusBadRequest, err)
+		return
+	}
+	opts := orchestrator.DeployOptions{CopyVolumesFrom: values.Get("copy_volumes_from")}
+	if values.Has("copy_volumes_from") && !store.ValidName(opts.CopyVolumesFrom) {
+		h.error(w, http.StatusBadRequest, errors.New("copy_volumes_from must be an application name"))
+		return
+	}
 	zipPath, status, err := receiveZIP(w, r, h.tempDir, maxUploadBytes)
 	if err != nil {
 		h.error(w, status, err)
 		return
 	}
 	defer os.Remove(zipPath)
-	app, err := h.manager.Deploy(r.Context(), name, zipPath)
+	app, err := h.manager.DeployWith(r.Context(), name, zipPath, opts)
 	if app.Name != "" {
 		// Startup may fail or the uploader may disconnect after the app has
 		// been saved. Its domain still needs to route to the wakeup gateway.
@@ -384,15 +394,18 @@ func (h *handler) caddy(w http.ResponseWriter, r *http.Request) {
 	if values.Has("gateway") {
 		gateway = values.Get("gateway")
 	}
-	httpOnly := false
+	mode := caddy.HTTPS
 	if values.Has("http") {
-		httpOnly, err = strconv.ParseBool(values.Get("http"))
+		httpOnly, err := strconv.ParseBool(values.Get("http"))
 		if err != nil {
 			h.error(w, http.StatusBadRequest, errors.New("http must be true or false"))
 			return
 		}
+		if httpOnly {
+			mode = caddy.HTTP
+		}
 	}
-	config, err := caddy.Config(h.manager.Sites(), gateway, httpOnly)
+	config, err := caddy.Config(h.manager.Sites(), gateway, mode)
 	if err != nil {
 		h.error(w, http.StatusBadRequest, err)
 		return

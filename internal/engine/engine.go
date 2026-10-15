@@ -22,4 +22,11 @@ type Runtime interface {
 	Down(context.Context, model.App) error
 	Inspect(context.Context, model.App) (Status, error)
 	Logs(context.Context, model.App, int) (string, error)
+	// ExistingVolumes returns which of the app's named volumes, by their
+	// Compose names, already exist.
+	ExistingVolumes(ctx context.Context, app model.App, volumes []string) ([]string, error)
+	// CopyVolumes creates target's project without starting it, then replaces
+	// the contents of each named volume with source's. Source's running
+	// containers are paused meanwhile, so the copy is a point-in-time snapshot.
+	CopyVolumes(ctx context.Context, source, target model.App, volumes []string) error
 }

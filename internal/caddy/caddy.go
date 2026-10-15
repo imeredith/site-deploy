@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,12 +20,32 @@ import (
 	"site-deploy/internal/model"
 )
 
+// Mode selects how Caddy serves application domains.
+type Mode int
+
+const (
+	// HTTPS serves port 443 with publicly trusted certificates from Caddy's
+	// automatic HTTPS, which needs the domains reachable for ACME challenges.
+	HTTPS Mode = iota
+	// InternalHTTPS serves port 443 with certificates from Caddy's local CA.
+	// Browsers do not trust that CA, but it needs no public ACME challenge,
+	// which suits hosts that are reachable only privately.
+	InternalHTTPS
+	// HTTP serves plain HTTP on port 80.
+	HTTP
+)
+
 // Config returns a complete Caddy configuration, replacing any existing sites
 // when loaded. Caddy terminates TLS and forwards only registered application
 // domains to the host-local gateway, which wakes the corresponding application.
 // Sites with basic auth get their own route that checks credentials first, so
 // unauthenticated requests are answered by Caddy and never wake an application.
-func Config(sites []model.Site, gateway string, httpOnly bool) ([]byte, error) {
+//
+// Caddy also loads every .pem file in certFolders, each holding a certificate
+// chain and its private key, and obtains no certificate for the names those
+// cover. The folders are paths as Caddy sees them, so a containerized Caddy
+// reads them from its own mounts.
+func Config(sites []model.Site, gateway string, mode Mode, certFolders ...string) ([]byte, error) {
 	if !loopbackSocket(gateway) {
 		return nil, errors.New("gateway must be a literal loopback IP address and port, such as 127.0.0.1:9080")
 	}
@@ -98,15 +119,45 @@ func Config(sites []model.Site, gateway string, httpOnly bool) ([]byte, error) {
 		"handle": []any{map[string]any{"handler": "static_response", "status_code": 404}},
 	})
 	server := map[string]any{"listen": []string{":443"}, "routes": routes}
-	if httpOnly {
+	apps := map[string]any{"http": map[string]any{
+		"servers": map[string]any{"site-deploy": server},
+	}}
+	switch mode {
+	case HTTPS:
+	case InternalHTTPS:
+		apps["tls"] = map[string]any{"automation": map[string]any{
+			"policies": []any{map[string]any{"issuers": []any{map[string]any{"module": "internal"}}}},
+		}}
+		// Caddy otherwise tries to add its root to the system trust store,
+		// which fails in a container and trusts nothing for remote browsers.
+		apps["pki"] = map[string]any{"certificate_authorities": map[string]any{
+			"local": map[string]any{"install_trust": false},
+		}}
+	case HTTP:
 		server["listen"] = []string{":80"}
 		server["automatic_https"] = map[string]any{"disable": true}
+	default:
+		return nil, fmt.Errorf("unknown Caddy mode %d", mode)
+	}
+	if len(certFolders) > 0 {
+		if mode == HTTP {
+			return nil, errors.New("certificate folders need HTTPS")
+		}
+		for _, folder := range certFolders {
+			if !path.IsAbs(folder) || path.Clean(folder) != folder {
+				return nil, fmt.Errorf("certificate folder %q must be a clean absolute path", folder)
+			}
+		}
+		tls, _ := apps["tls"].(map[string]any)
+		if tls == nil {
+			tls = map[string]any{}
+			apps["tls"] = tls
+		}
+		tls["certificates"] = map[string]any{"load_folders": certFolders}
 	}
 	config := map[string]any{
 		"admin": map[string]any{"listen": "127.0.0.1:2019"},
-		"apps": map[string]any{"http": map[string]any{
-			"servers": map[string]any{"site-deploy": server},
-		}},
+		"apps":  apps,
 	}
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {

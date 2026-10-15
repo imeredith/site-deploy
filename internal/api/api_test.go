@@ -89,6 +89,14 @@ func (*fakeRuntime) Inspect(context.Context, model.App) (engine.Status, error) {
 	return engine.Status{Suspended: true}, nil
 }
 
+func (*fakeRuntime) ExistingVolumes(context.Context, model.App, []string) ([]string, error) {
+	return nil, nil
+}
+
+func (*fakeRuntime) CopyVolumes(context.Context, model.App, model.App, []string) error {
+	return nil
+}
+
 func (f *fakeRuntime) Logs(_ context.Context, _ model.App, tail int) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -341,6 +349,11 @@ func TestConflictsBusyAndValidationErrors(t *testing.T) {
 	requireStatus(t, request(f.handler, http.MethodPost, "/v1/apps/api-broken", strings.NewReader("not a ZIP")), http.StatusBadRequest)
 	response := request(f.handler, http.MethodPost, "/v1/apps/api-invalid-domain", bytes.NewReader(bundle(t, "https://invalid.localhost")))
 	requireStatus(t, response, http.StatusBadRequest)
+	for _, query := range []string{"unknown=1", "copy_volumes_from=Bad", "copy_volumes_from=a&copy_volumes_from=b", "copy_volumes_from=missing"} {
+		response := request(f.handler, http.MethodPost, "/v1/apps/api-copy?"+query, bytes.NewReader(bundle(t, "api-copy.localhost")))
+		requireStatus(t, response, http.StatusBadRequest)
+	}
+	requireStatus(t, request(f.handler, http.MethodGet, "/v1/apps/api-copy", nil), http.StatusNotFound)
 	for _, endpoint := range []struct{ method, path string }{
 		{http.MethodPost, "/v1/apps/missing/suspend"},
 		{http.MethodPost, "/v1/apps/missing/resume"},

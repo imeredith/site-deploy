@@ -38,8 +38,10 @@ const (
 type options struct {
 	command, server, token, tokenFile, gateway string
 	registryVia, host, hostLabel, rsh          string
+	copyVolumesFrom, binary                    string
 	positionals, serveArgs, hostArgs, sshArgs  []string
 	tokenSet, tokenFileSet, json, httpOnly     bool
+	force, check                               bool
 	tailSet, gatewaySet, httpSet, help         bool
 	registryViaSet, serverSet, rshSet          bool
 	timeout                                    time.Duration
@@ -53,7 +55,9 @@ Commands:
                                  Manage the servers this CLI deploys to (host help for details)
   ssh [COMMAND...]               Run ssh to the selected host, with an optional remote command
   serve [options]                 Run the deployment daemon (serve --help for options)
-  deploy NAME ZIP                 Upload a ZIP containing a Compose application
+  deploy NAME ZIP [--copy-volumes-from APP]
+                                 Upload a ZIP containing a Compose application; optionally
+                                 start it with copies of APP's named volumes of the same names
   list                           List applications
   inspect NAME                   Show application details as JSON
   suspend NAME                   Stop an application, preserving its volumes
@@ -66,6 +70,10 @@ Commands:
                                  Push a local Docker image to the daemon's private registry
   images                         List images in the private registry and the apps using them
   cleanup                        Remove unused registry tags and Docker images now
+  upgrade [HOST] [--check] [--force] [--binary FILE]
+                                 Install this CLI's version as the host's daemon, over SSH,
+                                 if it is newer than the installed one and not older than
+                                 the repository's latest; --check only reports
   version                        Print the CLI version
   daemon-version                 Print CLI and daemon versions; fails if the CLI is older
   help                           Show this help
@@ -117,6 +125,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		if code, err = runSSH(opts, stdout, stderr); err == nil {
 			return code
 		}
+	} else if opts.command == "upgrade" {
+		err = runUpgrade(opts, stdout, stderr)
 	} else if opts.command == "version" {
 		if opts.json {
 			err = json.NewEncoder(stdout).Encode(map[string]string{"version": version.Version})
@@ -182,7 +192,7 @@ func parse(args []string) (options, error) {
 			name = "--rsh"
 		}
 		switch name {
-		case "--json", "--http", "--help", "-h", "--version":
+		case "--json", "--http", "--help", "-h", "--version", "--force", "--check":
 			enabled := true
 			if hasValue {
 				var err error
@@ -194,6 +204,10 @@ func parse(args []string) (options, error) {
 			switch name {
 			case "--json":
 				opts.json = enabled
+			case "--force":
+				opts.force = enabled
+			case "--check":
+				opts.check = enabled
 			case "--http":
 				opts.httpOnly, opts.httpSet = enabled, true
 			case "--version":
@@ -203,7 +217,7 @@ func parse(args []string) (options, error) {
 			default:
 				opts.help = enabled
 			}
-		case "--server", "--token", "--token-file", "--timeout", "--tail", "--gateway", "--registry-via", "--host", "--rsh":
+		case "--server", "--token", "--token-file", "--timeout", "--tail", "--gateway", "--registry-via", "--host", "--rsh", "--copy-volumes-from", "--binary":
 			if !hasValue {
 				i++
 				if i == len(args) {
@@ -226,6 +240,10 @@ func parse(args []string) (options, error) {
 				opts.gateway, opts.gatewaySet = value, true
 			case "--registry-via":
 				opts.registryVia, opts.registryViaSet = value, true
+			case "--copy-volumes-from":
+				opts.copyVolumesFrom = value
+			case "--binary":
+				opts.binary = value
 			case "--tail":
 				n, err := strconv.Atoi(value)
 				if err != nil || n < 1 || n > 10000 {
@@ -256,8 +274,16 @@ func parse(args []string) (options, error) {
 	case "inspect", "suspend", "resume", "delete", "logs":
 		want = 1
 	case "list", "caddy-config", "version", "daemon-version", "images", "cleanup":
+	case "upgrade":
+		if len(opts.positionals) > 1 {
+			return opts, errors.New("upgrade expects at most one host name")
+		}
+		want = len(opts.positionals)
 	default:
 		return opts, fmt.Errorf("unknown command %q", opts.command)
+	}
+	if (opts.force || opts.check || opts.binary != "") && opts.command != "upgrade" {
+		return opts, errors.New("--force, --check and --binary are only valid for upgrade")
 	}
 	if len(opts.positionals) != want {
 		return opts, fmt.Errorf("%s expects %d positional argument(s)", opts.command, want)
@@ -268,6 +294,14 @@ func parse(args []string) (options, error) {
 	if opts.registryViaSet && opts.command != "push" {
 		return opts, errors.New("--registry-via is only valid for push")
 	}
+	if opts.copyVolumesFrom != "" {
+		if opts.command != "deploy" {
+			return opts, errors.New("--copy-volumes-from is only valid for deploy")
+		}
+		if !store.ValidName(opts.copyVolumesFrom) || opts.copyVolumesFrom == opts.positionals[0] {
+			return opts, errors.New("--copy-volumes-from must name another application")
+		}
+	}
 	if opts.command == "push" {
 		repository, tag, found := strings.Cut(opts.positionals[1], ":")
 		if opts.positionals[0] == "" || !found || !images.ValidRepository(repository) || !images.ValidTag(tag) {
@@ -275,6 +309,12 @@ func parse(args []string) (options, error) {
 		}
 		if opts.registryVia != "" && !loopbackHostPort(opts.registryVia) {
 			return opts, errors.New("--registry-via must be a literal loopback IP and port, such as 127.0.0.1:41234")
+		}
+		return opts, nil
+	}
+	if opts.command == "upgrade" {
+		if want == 1 && !hostName.MatchString(opts.positionals[0]) {
+			return opts, fmt.Errorf("host name %q must be 1-48 lowercase letters, digits or hyphens", opts.positionals[0])
 		}
 		return opts, nil
 	}
@@ -356,6 +396,9 @@ func runClient(opts *options, stdout, stderr io.Writer) error {
 		}
 		defer file.Close()
 		body, size, method = io.NewSectionReader(file, 0, info.Size()), info.Size(), http.MethodPost
+		if opts.copyVolumesFrom != "" {
+			query.Set("copy_volumes_from", opts.copyVolumesFrom)
+		}
 	case "suspend", "resume":
 		path, method = path+"/"+opts.command, http.MethodPost
 	case "delete":
@@ -392,6 +435,13 @@ func runClient(opts *options, stdout, stderr io.Writer) error {
 	client := &http.Client{Transport: transport, Timeout: opts.timeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
+	if opts.copyVolumesFrom != "" {
+		// Older daemons ignore the parameter and would deploy without the copy.
+		if err := requireDaemon(client, *endpoint, opts.token, copyVolumesVersion, "--copy-volumes-from"); err != nil {
+			return err
+		}
+		fmt.Fprintf(stderr, "Copying named volumes from %s, which is paused while they copy\n", opts.copyVolumesFrom)
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return fmt.Errorf("control API request: %w", err)
@@ -426,6 +476,36 @@ func runClient(opts *options, stdout, stderr io.Writer) error {
 		return pushImage(*opts, data, stdout, stderr)
 	}
 	return printResult(stdout, *opts, data)
+}
+
+// copyVolumesVersion is the first daemon version with deploy --copy-volumes-from.
+const copyVolumesVersion = "0.7.0"
+
+// requireDaemon fails unless the daemon is at least minimum, for features that
+// older daemons would silently ignore rather than refuse. Dev builds pass.
+func requireDaemon(client *http.Client, endpoint url.URL, token, minimum, feature string) error {
+	endpoint.Path, endpoint.RawQuery = "/v1/version", ""
+	request, err := http.NewRequest(http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return fmt.Errorf("create API request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Accept", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		return fmt.Errorf("control API request: %w", err)
+	}
+	defer response.Body.Close()
+	var result struct {
+		Version string `json:"version"`
+	}
+	if response.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(response.Body, maxResponseBytes)).Decode(&result) != nil || result.Version == "" {
+		return fmt.Errorf("control API returned no daemon version (HTTP %d)", response.StatusCode)
+	}
+	if order, ok := version.Compare(result.Version, minimum); ok && order < 0 {
+		return fmt.Errorf("%s needs daemon %s or newer, and this one is %s; upgrade it first", feature, minimum, diagnostic(result.Version, token))
+	}
+	return nil
 }
 
 // dockerCommand runs the local docker CLI; tests replace it.

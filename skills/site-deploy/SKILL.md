@@ -1,6 +1,6 @@
 ---
 name: site-deploy
-description: Deploy and manage web apps on self-hosted site-deploy servers with the site-deploy CLI. Use this whenever the user wants to deploy, publish, host, preview, or put online a site, app, static page, or Docker container "on my server", on one of their site-deploy hosts or its domains, or "with site-deploy"; whenever they ask to list, inspect, check logs of, suspend, resume, redeploy, update, or delete something already deployed there; when packaging a Docker Compose app as a site-deploy ZIP bundle; and when upgrading or releasing site-deploy itself (VERSION bumps, deploy/upgrade.sh, "upgrade the CLI first", HTTP 426, CLI/daemon version mismatch).
+description: Deploy and manage web apps on self-hosted site-deploy servers with the site-deploy CLI. Use this whenever the user wants to deploy, publish, host, preview, or put online a site, app, static page, or Docker container "on my server", on one of their site-deploy hosts or its domains, or "with site-deploy"; whenever they ask to list, inspect, check logs of, suspend, resume, redeploy, update, or delete something already deployed there; when packaging a Docker Compose app as a site-deploy ZIP bundle; and when upgrading or releasing site-deploy itself (VERSION bumps, site-deploy upgrade, make upgrade, "upgrade the CLI first", HTTP 426, CLI/daemon version mismatch).
 ---
 
 # site-deploy
@@ -35,6 +35,7 @@ If it fails:
 | `site-deploy list` | Name, domain, state, idle timeout, access (`public` / `basic auth (N)`). Add `--json` for everything |
 | `site-deploy inspect NAME` | Full JSON record, including `error`, `upstream`, `project` |
 | `site-deploy deploy NAME bundle.zip` | Uploads, validates, starts, and waits until healthy. Default timeout is 10m (`--timeout`) |
+| `site-deploy deploy NAME bundle.zip --copy-volumes-from APP` | Starts with copies of APP's named volumes of the same names (daemon 0.7.0+). See "Previews with real data" |
 | `site-deploy logs NAME [--tail N]` | A snapshot (default 100 lines, max 10000), not a live follow |
 | `site-deploy suspend NAME` / `resume NAME` | Suspended apps also wake on their next request |
 | `site-deploy delete NAME` | Removes containers, networks, and uploaded files. Named volumes are kept |
@@ -71,6 +72,13 @@ There is no in-place update or rollback. Replacing an app means `delete` followe
 
 Because delete is destructive and visible to users, confirm with the user before deleting an app that's serving traffic. Keep the old ZIP, or note how to rebuild it, so you can redeploy it if the new version fails.
 
+## Previews with real data
+
+`deploy NAME bundle.zip --copy-volumes-from APP` starts a new app, such as a pull-request preview, with copies of APP's named volumes. Each volume the bundle declares under the same name as one of APP's is copied before the first start; the rest start empty. APP is paused while the copy runs, so the copy is consistent, and its requests wait rather than fail. The README has the details ("Starting with another application's data").
+
+- **First deploy only.** The copy never overwrites: if NAME's volume already exists, for example kept by an earlier `delete`, deploy refuses. To refresh a preview's data, delete the preview, remove its volume on the server (`site-deploy ssh -- docker volume rm PROJECT_VOLUME`, with the project from `inspect`), and deploy again with the option. Confirm with the user first, since that discards the preview's own data. Never remove volumes of the app you are copying from.
+- **It's production data in a preview.** Accounts, password hashes, API tokens and the app's own secrets come along, so keep previews behind basic auth. Anything the app does by itself with that data also comes along: scheduled jobs, crawls, emails, Slack or webhook notifications. Check for those before copying, and turn them off for the copy (usually an environment variable in the preview's compose file) so a preview doesn't act on real users' behalf. If the app signs tokens with keys stored in its data, give the copy new keys: a preview runs unreviewed code, and tokens it signs with production's keys may be valid on production.
+
 ## Behaviour worth knowing
 
 - **Idle suspension:** after `idle_timeout` (default `5m`) with no gateway requests, the whole Compose project stops, databases included. The next request waits for a cold start, usually about 1s for small apps. If a browser page load waits more than 1s (daemon 0.4.0+), the visitor sees a "Starting up" page with a spinner that reloads into the app when it's ready; API calls and form posts just wait. Background jobs, cron work, and direct database connections don't count as activity. Use `idle_timeout: 0` for anything that must keep running.
@@ -87,12 +95,16 @@ Because delete is destructive and visible to users, confirm with the user before
 Do this only when the user asks for a site-deploy change or release. The procedure is in the repo README, "Versions and upgrades". In short:
 
 1. Make and test the change in the site-deploy checkout: `make check`. If engine or Compose handling changed, also run the Docker integration test on the servers (README, "Scope and validation"). It namespaces and cleans up after itself.
-2. Bump `VERSION` (semver). `deploy/upgrade.sh` refuses same-or-older versions, which keeps the "CLI ≥ daemon" rule meaningful.
+2. Bump `VERSION` (semver). `site-deploy upgrade` installs only a version newer than the host's, which keeps the "CLI ≥ daemon" rule meaningful.
 3. Commit and push to GitHub first if any host is deployed to by the GitHub Action (README "GitHub Actions"). The action builds its CLI from the ref workflows use, normally `main`, so a daemon newer than that makes those workflows fail with 426.
-4. Run `deploy/upgrade.sh HOST`. It upgrades the local CLI **first**, then the daemon. Before switching it backs up `/var/lib/site-deploy` and waits for the new version to report in. If it doesn't, it restores the previous release automatically. Running apps keep running, but public requests fail for the few seconds the daemon restarts.
+4. Run `make upgrade HOST=NAME` in the checkout. It installs the local CLI **first** (`make install-cli`, which also installs Linux server builds for amd64 and arm64), then runs `site-deploy upgrade NAME`, which installs the CLI's own version as the host's daemon:
+   - It installs only a newer version than the host runs. If the host is up to date it says so and does nothing.
+   - It refuses a CLI older than the repository's latest (`VERSION` on `main`), and warns when the CLI is newer, that is, not pushed yet (see step 3).
+   - Before switching, the server backs up `/var/lib/site-deploy` and waits for the new version to report in. If it doesn't, it restores the previous release automatically. Running apps keep running, but public requests fail for the few seconds the daemon restarts.
+   - `site-deploy upgrade NAME --check` reports the installed, CLI and repository versions without changing anything.
 5. Confirm with `site-deploy --host HOST daemon-version`, and record the version wherever the server notes say.
 
-`--force` reinstalls the same version or downgrades. Ask before downgrading. If a release changed `store.DataFormat`, an older binary refuses to start, so the data backup has to be restored as well.
+`site-deploy upgrade NAME --force` reinstalls the same version, downgrades, or installs a CLI older than the repository's. Ask before downgrading. If a release changed `store.DataFormat`, an older binary refuses to start, so the data backup has to be restored as well.
 
 Compatibility rules when changing the API: newer CLIs must keep working against older daemons, and the API rejects unknown endpoints and query parameters. Gate new CLI features on the daemon version reported by `daemon-version` or `/v1/version`.
 

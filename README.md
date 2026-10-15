@@ -155,6 +155,7 @@ Commands contact the daemon; Docker only needs to be installed on the deployment
 ./bin/site-deploy --token-file .site-deploy/token logs hello --tail 100
 ./bin/site-deploy --token-file .site-deploy/token caddy-config --http
 ./bin/site-deploy --token-file .site-deploy/token delete hello
+./bin/site-deploy --token-file .site-deploy/token deploy hello-pr12 hello.zip --copy-volumes-from hello
 ./bin/site-deploy --token-file .site-deploy/token daemon-version
 ./bin/site-deploy --token-file .site-deploy/token push my-deps:local my-deps:2026-10-13
 ./bin/site-deploy --token-file .site-deploy/token images
@@ -164,6 +165,17 @@ Commands contact the daemon; Docker only needs to be installed on the deployment
 Common options include `--host`, `--server`, `--token-file`, `--token`, and `--json`; flags can appear before or after the command (before `host` and `ssh`). From a workstation, commands normally go to a configured [host](#hosts). `SITE_DEPLOY_HOST`, `SITE_DEPLOY_SERVER`, `SITE_DEPLOY_TOKEN_FILE`, and `SITE_DEPLOY_TOKEN` also configure the client. The default token file is `.site-deploy/token`; prefer it to putting a token in shell history. `--timeout` controls the entire upload/request deadline and defaults to `10m`. Names start with a lowercase letter and contain at most 48 lowercase letters, digits, or hyphens.
 
 Deploying an existing name or domain returns a conflict. There are no rolling updates or rollback commands. To replace a bundle, delete its deployment and deploy the new ZIP with the same name. This causes downtime. Deletion removes containers, networks, and extracted files, while named volumes are retained under the application's stable Compose project. Reusing the same data directory, application name, and volume names reconnects that data. Persistent writes belong in named volumes: uploaded bind directories are removed on deletion. Anonymous volumes are not a reliable way to reconnect data after redeployment.
+
+### Starting with another application's data
+
+`deploy NAME ZIP --copy-volumes-from APP` (daemon 0.7.0+) starts the new application with copies of APP's named volumes, for example a pull-request preview with a copy of production's database. Each named volume the new bundle declares that APP also declares, by the same name, is copied before the first start; the others start empty, as usual. APP is paused for as long as the copy takes, so the copy is a consistent point-in-time snapshot of every volume, like a power cut: SQLite and PostgreSQL recover from it as they do after a crash. Its requests wait meanwhile rather than fail. The copy runs in a `busybox:1.37` container (daemon `--volume-copy-image`), keeping owners, modes, and symlinks.
+
+- **Nothing is overwritten.** If a volume the copy would fill already exists, for example one kept by deleting an earlier deployment of NAME, deploy refuses before saving anything. Remove that volume on the server (`docker volume rm PROJECT_VOLUME`; `inspect` shows the project) to take a fresh copy, or deploy without the option to keep using it.
+- **Only the first start copies.** Later resumes, and redeploys without the option, use the volumes as they are, so the two applications' data diverge from then on.
+- **APP must have started once**, so its volumes exist. An application never copies its own volumes.
+- **If the copy fails**, deploy reports it and the application is saved in the `error` state with no volumes. Delete it and deploy again. A later wake would start it empty.
+- **The copy is real data.** Everything in the volumes comes along: accounts, password hashes, API tokens, and the application's own secrets, such as signing keys stored in its database. So does anything the application does on its own with that data, such as scheduled jobs or notifications, unless its configuration turns that off for copies. If the copy runs code you haven't reviewed, such as a pull request's, give it its own signing keys: tokens it signs with APP's keys may be valid on APP.
+- The CLI checks the daemon's version first, because older daemons ignore the option and would deploy without the copy.
 
 Fresh data directories receive distinct Docker project prefixes, saved in `DATA_DIR/project-prefix`. Back up that file with the rest of the data directory. Existing installations retain their original `sd-NAME` projects to preserve volume access; those legacy installations still need distinct application names when sharing Docker. `inspect --json` shows each application's actual project name.
 
@@ -190,9 +202,9 @@ Alternatively, start Caddy first and enable automatic synchronization on the dae
   --caddy-admin http://127.0.0.1:2019
 ```
 
-For local HTTP development, add `--http` to this `serve` command. **`--caddy-admin` replaces Caddy's entire configuration**, including any other sites. Use it only with a Caddy instance dedicated to this orchestrator. It loads configuration on startup, after deploy/delete, and periodically to retry failed synchronization. If initial synchronization fails, the daemon exits; later failures are reported without undoing a completed deployment. Keep the admin endpoint on loopback. API-loaded configuration is separate from your JSON file: restart the daemon after restarting Caddy, or allow its periodic synchronization to restore the routes.
+For local HTTP development, add `--http` to this `serve` command. On a host that public ACME challenges cannot reach, such as one behind a VPN, add `--tls-internal` instead: Caddy issues certificates from its own local CA, so HTTPS works, but browsers warn until that CA's root (`pki/authorities/local/root.crt` in Caddy's data directory) is trusted. `caddy-config` does not render this mode. To serve certificates you obtained yourself, such as a wildcard from a manual DNS challenge, add `--tls-cert-dir DIR` (daemon 0.8.1+): Caddy loads every `.pem` file in `DIR`, each a certificate chain followed by its private key, and obtains no certificate for the names they cover, while other names are handled as before. `DIR` is a path as Caddy sees it, so a Caddy in Docker needs it inside one of its mounts, such as `/data/site-deploy-certs`. Caddy reads the files only when its configuration changes, so after replacing one, force a reload: `curl -s 127.0.0.1:2019/config/ | curl -sS -X POST -H 'Content-Type: application/json' -H 'Cache-Control: must-revalidate' --data-binary @- 127.0.0.1:2019/load`. **`--caddy-admin` replaces Caddy's entire configuration**, including any other sites. Use it only with a Caddy instance dedicated to this orchestrator. It loads configuration on startup, after deploy/delete, and periodically to retry failed synchronization. If initial synchronization fails, the daemon exits; later failures are reported without undoing a completed deployment. Keep the admin endpoint on loopback. API-loaded configuration is separate from your JSON file: restart the daemon after restarting Caddy, or allow its periodic synchronization to restore the routes.
 
-[`deploy/upgrade.sh`](#versions-and-upgrades) automates the following installation steps and later upgrades. The example [systemd unit](deploy/site-deploy.service) runs the daemon as a `site-deploy` account with access to the `docker` group and stores state in `/var/lib/site-deploy`. Create that account first, install the binary at `/usr/local/bin/site-deploy`, and install the unit as `/etc/systemd/system/site-deploy.service`:
+[`site-deploy upgrade`](#versions-and-upgrades) automates the following installation steps and later upgrades. The example [systemd unit](deploy/site-deploy.service) runs the daemon as a `site-deploy` account with access to the `docker` group and stores state in `/var/lib/site-deploy`. Create that account first, install the binary at `/usr/local/bin/site-deploy`, and install the unit as `/etc/systemd/system/site-deploy.service`:
 
 ```sh
 sudo useradd --system --user-group --home-dir /var/lib/site-deploy --shell /usr/sbin/nologin site-deploy
@@ -311,8 +323,6 @@ The key, known hosts and token are written under `RUNNER_TEMP`, which the runner
 
 The daemon rejects CLIs older than itself, and the action's CLI comes from the ref a workflow names. With `@main`, push this repository to GitHub before upgrading a daemon that CI deploys to. A workflow pinned to an older tag needs a newer one once the daemon passes it.
 
-This repository is private. For workflows in your other repositories to use the action, set **Settings → Actions → General → Access** to allow repositories owned by the account.
-
 ## Versions and upgrades
 
 `VERSION` holds the release version. `make build` stamps it, plus the commit as build metadata (`0.1.0+abc1234`, with `.dirty` for uncommitted changes). Metadata does not affect ordering. Bump `VERSION` for every build you install on a server.
@@ -321,14 +331,22 @@ This repository is private. For workflows in your other repositories to use the 
 
 Because of that rule, always upgrade the CLI first, then the daemon. Newer CLIs must keep working against older daemons. When adding API features, gate them on the daemon's version: the API rejects unknown query parameters and endpoints.
 
-Upgrade a server from a checkout with:
+`site-deploy upgrade` installs the CLI's own version as a host's daemon, so the CLI is always upgraded first. From a checkout:
 
 ```sh
-deploy/upgrade.sh HOST            # a configured host; refuses unless VERSION is newer than the running daemon
-deploy/upgrade.sh --force HOST    # reinstall the same version, or downgrade
+make install-cli                  # the CLI, plus Linux server builds for amd64 and arm64 beside it
+site-deploy upgrade HOST          # or --host HOST; installs only a newer version
+site-deploy upgrade HOST --check  # report the versions and what it would do, and change nothing
+make upgrade HOST=NAME            # both steps
 ```
 
-The script builds, installs the CLI locally (`make install-cli`), and builds a server binary for the server's architecture (amd64 or arm64, with `make server GOARCH=...`). It copies that binary, the unit and [`deploy/install-host.sh`](deploy/install-host.sh) to the server through the host's remote shell, then runs the script with `sudo`. The SSH user needs passwordless sudo. A plain SSH destination works in place of a host, with `SITE_DEPLOY_RSH` for its remote shell. `install-host.sh` also performs first installs, after which `upgrade.sh` saves the new daemon's token as the host's token. It:
+Before installing, it compares three versions, ignoring build metadata:
+
+- **The installed daemon's.** It installs only a newer version. When the host already runs this version it says so and does nothing. When the host runs a newer one it refuses: update the CLI first.
+- **The repository's latest**, `VERSION` on the `main` branch of the GitHub repository (`SITE_DEPLOY_VERSION_URL` overrides the address). A CLI older than that is refused: update the checkout and run `make install-cli`. A newer CLI, not pushed yet, gets a warning, because workflows using the [GitHub Action](#github-actions) build their CLI from the repository and a newer daemon refuses it (HTTP 426). If the repository can't be reached, it warns and carries on.
+- `--force` installs anyway: to reinstall the same version, downgrade, or install a CLI older than the repository's.
+
+The server binary is the CLI itself when the server has the same CPU architecture, and otherwise the build that `make install-cli` puts in `PREFIX/lib/site-deploy/linux-ARCH/` (`--binary FILE` names another). It must be a Linux build of the CLI's exact version for the server's architecture, which the CLI reads from the binary's Go build information. The CLI sends it, the unit and [`deploy/install-host.sh`](deploy/install-host.sh) to the server through the host's remote shell in one SSH session, and runs the script with `sudo`. The SSH user needs passwordless sudo. `SITE_DEPLOY_SSH` (with `SITE_DEPLOY_RSH`) works in place of a configured host. `install-host.sh` also performs first installs, after which `upgrade` saves the new daemon's token as the host's token. It:
 
 1. Keeps each release in `/usr/local/lib/site-deploy/VERSION/` and points `/usr/local/bin/site-deploy` at the active one. The newest five releases are kept.
 2. Creates the `site-deploy` account if needed and installs the unit. It leaves drop-ins such as `/etc/systemd/system/site-deploy.service.d/*.conf` untouched, so put host-specific flags like `--caddy-admin` there.

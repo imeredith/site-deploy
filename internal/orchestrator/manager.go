@@ -317,7 +317,28 @@ func (m *Manager) Sites() []model.Site {
 	return sites
 }
 
+// DeployOptions adjusts a deployment.
+type DeployOptions struct {
+	// CopyVolumesFrom names an application whose named volumes are copied into
+	// the new application's volumes of the same names before its first start.
+	CopyVolumesFrom string
+}
+
+// volumeSeed is a copy of named volumes that an initial start makes first.
+type volumeSeed struct {
+	source  *entry
+	volumes []string
+}
+
+// volumeCopyTimeout bounds creating the new project and copying its volumes,
+// separately from the application's start timeout.
+const volumeCopyTimeout = 10 * time.Minute
+
 func (m *Manager) Deploy(ctx context.Context, name, zipPath string) (model.App, error) {
+	return m.DeployWith(ctx, name, zipPath, DeployOptions{})
+}
+
+func (m *Manager) DeployWith(ctx context.Context, name, zipPath string, opts DeployOptions) (model.App, error) {
 	if !store.ValidName(name) {
 		return model.App{}, fmt.Errorf("%w: name must start with a lowercase letter and contain at most 48 lowercase letters, digits, or hyphens", ErrInvalid)
 	}
@@ -353,6 +374,13 @@ func (m *Manager) Deploy(ctx context.Context, name, zipPath string) (model.App, 
 	now := time.Now().UTC()
 	dir := filepath.Join(m.directory, "apps", name)
 	app := model.App{Name: name, Spec: spec, Project: m.projectPrefix + name, Directory: dir, ComposeFile: m.composePath(name), State: model.StateSuspended, CreatedAt: now, UpdatedAt: now, LastActivity: now}
+	var seed *volumeSeed
+	if opts.CopyVolumesFrom != "" {
+		seed, err = m.planVolumeCopy(ctx, app, generated, opts.CopyVolumesFrom)
+		if err != nil {
+			return model.App{}, err
+		}
+	}
 	e := &entry{app: app}
 	m.mu.Lock()
 	if m.apps[name] != nil || m.domains[spec.Domain] != nil {
@@ -394,7 +422,7 @@ func (m *Manager) Deploy(ctx context.Context, name, zipPath string) (model.App, 
 	m.apps[name] = e
 	m.domains[spec.Domain] = e
 	e.mu.Lock()
-	op, err := m.startLocked(e, true)
+	op, err := m.startLocked(e, true, seed)
 	e.mu.Unlock()
 	m.mu.Unlock()
 	if err != nil {
@@ -402,6 +430,130 @@ func (m *Manager) Deploy(ctx context.Context, name, zipPath string) (model.App, 
 	}
 	err = await(ctx, op)
 	return snapshot(e), err
+}
+
+// planVolumeCopy checks that the new application target can copy the named
+// volumes it shares with the application source, before anything is saved.
+// generated is target's Compose file.
+func (m *Manager) planVolumeCopy(ctx context.Context, target model.App, generated, source string) (*volumeSeed, error) {
+	if source == target.Name {
+		return nil, fmt.Errorf("%w: an application cannot copy its own volumes", ErrInvalid)
+	}
+	e, err := m.lookup(source)
+	if err != nil {
+		return nil, fmt.Errorf("%w: application %q, to copy volumes from, is not deployed", ErrInvalid, source)
+	}
+	data, err := os.ReadFile(generated)
+	if err != nil {
+		return nil, err
+	}
+	wanted, err := manifest.NamedVolumes(data)
+	if err != nil {
+		return nil, err
+	}
+	sourceApp := snapshot(e)
+	data, err = os.ReadFile(sourceApp.ComposeFile)
+	if err != nil {
+		return nil, fmt.Errorf("read Compose file of %q: %w", source, err)
+	}
+	available, err := manifest.NamedVolumes(data)
+	if err != nil {
+		return nil, err
+	}
+	var volumes []string
+	for _, volume := range wanted {
+		if slices.Contains(available, volume) {
+			volumes = append(volumes, volume)
+		}
+	}
+	if len(volumes) == 0 {
+		return nil, fmt.Errorf("%w: %q has no named volumes with the same names as %q's", ErrInvalid, target.Name, source)
+	}
+	present, err := m.runtime.ExistingVolumes(ctx, sourceApp, volumes)
+	if err != nil {
+		return nil, err
+	}
+	if len(present) != len(volumes) {
+		var missing []string
+		for _, volume := range volumes {
+			if !slices.Contains(present, sourceApp.Project+"_"+volume) {
+				missing = append(missing, volume)
+			}
+		}
+		return nil, fmt.Errorf("%w: %q's volume %s does not exist yet; start it once first", ErrInvalid, source, strings.Join(missing, ", "))
+	}
+	// A volume kept from an earlier deployment of the same name holds data.
+	// Never replace it: whoever removes it decides that data is not needed.
+	existing, err := m.runtime.ExistingVolumes(ctx, target, volumes)
+	if err != nil {
+		return nil, err
+	}
+	if len(existing) > 0 {
+		return nil, fmt.Errorf("%w: volume %s already exists, kept from an earlier deployment of %q; remove it on the server (docker volume rm) to copy %q's instead", ErrConflict, strings.Join(existing, ", "), target.Name, source)
+	}
+	return &volumeSeed{source: e, volumes: volumes}, nil
+}
+
+// copyVolumes runs seed's copy into target. The source is held for the copy,
+// so it is neither started, suspended, nor deleted meanwhile, and its requests
+// wait until its containers resume. The caller must not hold imagesMu: an
+// operation in progress on the source, which this waits for, may need it.
+func (m *Manager) copyVolumes(target model.App, seed *volumeSeed) error {
+	ctx, cancel := context.WithTimeout(m.ctx, volumeCopyTimeout)
+	defer cancel()
+	e := seed.source
+	var op *operation
+	var source model.App
+	for op == nil {
+		e.mu.Lock()
+		if e.removed || e.app.State == model.StateDeleting {
+			name := e.app.Name
+			e.mu.Unlock()
+			return fmt.Errorf("application %q, to copy volumes from, was deleted", name)
+		}
+		if busy := e.op; busy != nil {
+			e.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-busy.done:
+			}
+			continue
+		}
+		op = &operation{done: make(chan struct{})}
+		e.op = op
+		source = e.app
+		e.mu.Unlock()
+	}
+	m.imagesMu.RLock()
+	err := m.runtime.CopyVolumes(ctx, source, target, seed.volumes)
+	m.imagesMu.RUnlock()
+	stuck := false
+	if err != nil && source.State == model.StateRunning {
+		// The copy may have left containers paused. The next request must then
+		// reconcile the project, which unpauses them, rather than wait on it.
+		checkCtx, cancelCheck := context.WithTimeout(m.ctx, 30*time.Second)
+		status, inspectErr := m.runtime.Inspect(checkCtx, source)
+		cancelCheck()
+		stuck = inspectErr != nil || !status.Running
+	}
+	e.mu.Lock()
+	if stuck {
+		e.app.State = model.StateError
+		e.app.Upstream = ""
+		e.app.Error = fmt.Sprintf("not running after copying its volumes to %q", target.Name)
+		e.app.UpdatedAt = time.Now().UTC()
+		if saveErr := m.store.Save(e.app); saveErr != nil {
+			slog.Warn("persist state", "app", source.Name, "error", saveErr)
+		}
+	}
+	e.op = nil
+	close(op.done)
+	e.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("copy volumes from %q: %w", source.Name, err)
+	}
+	return nil
 }
 
 func await(ctx context.Context, op *operation) error {
@@ -414,8 +566,9 @@ func await(ctx context.Context, op *operation) error {
 }
 
 // Caller holds e.mu. Startup is owned by the daemon, so a cancelled HTTP
-// request cannot abort startup needed by other waiting requests.
-func (m *Manager) startLocked(e *entry, initial bool) (*operation, error) {
+// request cannot abort startup needed by other waiting requests. An initial
+// start copies seed's volumes, if any, first.
+func (m *Manager) startLocked(e *entry, initial bool, seed *volumeSeed) (*operation, error) {
 	op := &operation{done: make(chan struct{})}
 	e.generation++
 	e.wakeError = nil
@@ -431,13 +584,16 @@ func (m *Manager) startLocked(e *entry, initial bool) (*operation, error) {
 	e.op = op
 	app := e.app
 	if !m.launch(func() {
+		// Nothing has started yet if a host path is refused, so there is
+		// nothing to clean up. A failed copy cleans up after itself.
+		err := m.checkHostPaths(app)
+		if err == nil && initial && seed != nil {
+			err = m.copyVolumes(app, seed)
+		}
 		m.imagesMu.RLock()
 		ctx, cancel := context.WithTimeout(m.ctx, app.Spec.StartDuration())
 		defer cancel()
 		var upstream string
-		// Nothing has started yet if a host path is refused, so there is
-		// nothing to clean up.
-		err := m.checkHostPaths(app)
 		if err == nil {
 			if initial {
 				upstream, err = m.runtime.Up(ctx, app)
@@ -637,7 +793,7 @@ func (m *Manager) running(ctx context.Context, e *entry, lease bool) (*Lease, er
 			e.mu.Unlock()
 			return nil, err
 		}
-		op, err := m.startLocked(e, false)
+		op, err := m.startLocked(e, false, nil)
 		e.mu.Unlock()
 		if err != nil {
 			return nil, err
@@ -671,7 +827,7 @@ func (m *Manager) Resume(ctx context.Context, name string) (model.App, error) {
 	// Existing requests keep their lease; reconciliation waits for a later call.
 	e.mu.Lock()
 	if !e.removed && e.op == nil && e.active == 0 && e.app.State == model.StateRunning {
-		op, startErr := m.startLocked(e, false)
+		op, startErr := m.startLocked(e, false, nil)
 		e.mu.Unlock()
 		if startErr != nil {
 			return snapshot(e), startErr

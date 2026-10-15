@@ -24,6 +24,17 @@ type fakeRuntime struct {
 	entered                                 chan struct{}
 	startError                              error
 	status                                  engine.Status
+	// volumes holds the Docker names of existing volumes.
+	volumes    map[string]bool
+	copies     []volumeCopy
+	copyGate   <-chan struct{}
+	copyError  error
+	copyPaused bool // a failed copy leaves the source paused
+}
+
+type volumeCopy struct {
+	source, target string
+	volumes        []string
 }
 
 func (f *fakeRuntime) Up(ctx context.Context, a model.App) (string, error) {
@@ -72,6 +83,42 @@ func (f *fakeRuntime) Inspect(context.Context, model.App) (engine.Status, error)
 	return f.status, nil
 }
 func (f *fakeRuntime) Logs(context.Context, model.App, int) (string, error) { return "hello\n", nil }
+func (f *fakeRuntime) ExistingVolumes(_ context.Context, a model.App, volumes []string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var existing []string
+	for _, volume := range volumes {
+		if f.volumes[a.Project+"_"+volume] {
+			existing = append(existing, a.Project+"_"+volume)
+		}
+	}
+	return existing, nil
+}
+func (f *fakeRuntime) CopyVolumes(ctx context.Context, source, target model.App, volumes []string) error {
+	f.mu.Lock()
+	gate, err := f.copyGate, f.copyError
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err != nil {
+		if f.copyPaused {
+			f.status = engine.Status{Partial: true}
+		}
+		return err
+	}
+	f.copies = append(f.copies, volumeCopy{source: source.Name, target: target.Name, volumes: volumes})
+	for _, volume := range volumes {
+		f.volumes[target.Project+"_"+volume] = true
+	}
+	return nil
+}
 
 func bundle(t *testing.T, domain string) string {
 	t.Helper()

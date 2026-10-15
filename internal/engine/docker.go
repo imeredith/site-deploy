@@ -26,6 +26,10 @@ const (
 	maxLogTail       = 10000
 )
 
+// DefaultCopyImage copies named volumes between projects. It needs sh, find,
+// and cp -a.
+const DefaultCopyImage = "busybox:1.37"
+
 // Docker runs a local Docker Compose installation. Its subprocesses receive an
 // explicit Docker host and project, rather than inheriting Compose settings.
 type Docker struct {
@@ -33,6 +37,8 @@ type Docker struct {
 	host   string
 	run    commandRunner
 	ready  func(context.Context, string) error
+	// CopyImage runs CopyVolumes. It is pulled when missing.
+	CopyImage string
 }
 
 type command struct {
@@ -61,7 +67,7 @@ func New(binary, host string) *Docker {
 	if host == "" {
 		host = "unix:///var/run/docker.sock"
 	}
-	return &Docker{binary: binary, host: host, run: runCommand, ready: waitTCP}
+	return &Docker{binary: binary, host: host, run: runCommand, ready: waitTCP, CopyImage: DefaultCopyImage}
 }
 
 func (d *Docker) Up(ctx context.Context, app model.App) (string, error) {
@@ -206,6 +212,102 @@ func (d *Docker) Logs(ctx context.Context, app model.App, tail int) (string, err
 		output = append(output, []byte("\n[output truncated at 1048576 bytes]\n")...)
 	}
 	return string(output), nil
+}
+
+// volumeName is the Docker name Compose gives a project's named volume.
+func volumeName(app model.App, volume string) string { return app.Project + "_" + volume }
+
+func (d *Docker) ExistingVolumes(ctx context.Context, app model.App, volumes []string) ([]string, error) {
+	output, err := d.Command(ctx, "volume", "ls", "--format", "{{.Name}}")
+	if err != nil {
+		return nil, err
+	}
+	names := strings.Fields(string(output))
+	var existing []string
+	for _, volume := range volumes {
+		name := volumeName(app, volume)
+		for _, other := range names {
+			if other == name {
+				existing = append(existing, name)
+				break
+			}
+		}
+	}
+	return existing, nil
+}
+
+// copyVolumesScript empties each target volume, which may hold files Docker
+// copied from the image when Compose created its containers, then copies the
+// source volume into it, keeping ownership, modes, timestamps, and symlinks.
+const copyVolumesScript = `set -e
+for to in /to/*; do
+	find "$to" -mindepth 1 -delete
+	cp -a "/from/${to#/to/}/." "$to/"
+done`
+
+func (d *Docker) CopyVolumes(ctx context.Context, source, target model.App, volumes []string) (err error) {
+	if len(volumes) == 0 {
+		return errors.New("no volumes to copy")
+	}
+	// Pull first, so the source is paused only for the copy itself.
+	if _, inspectErr := d.Command(ctx, "image", "inspect", "--format", "{{.Id}}", d.CopyImage); inspectErr != nil {
+		if _, err := d.Command(ctx, "pull", "--quiet", d.CopyImage); err != nil {
+			return fmt.Errorf("pull %s to copy volumes: %w", d.CopyImage, err)
+		}
+	}
+	// Compose creates the volumes itself, labelled as the project's own, which
+	// later starts expect. It also creates the containers, without starting them.
+	if _, err := d.compose(ctx, target, "create", "--no-build"); err != nil {
+		return err
+	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		// Never leave a partial copy for a later start to use: without its
+		// volumes, the application starts as if newly deployed.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+		defer cancel()
+		if _, downErr := d.compose(cleanupCtx, target, "down", "--remove-orphans", "--timeout", "20"); downErr != nil {
+			err = errors.Join(err, downErr)
+			return
+		}
+		args := []string{"volume", "rm", "--force"}
+		for _, volume := range volumes {
+			args = append(args, volumeName(target, volume))
+		}
+		if _, rmErr := d.Command(cleanupCtx, args...); rmErr != nil {
+			err = errors.Join(err, rmErr)
+		}
+	}()
+	running, err := d.compose(ctx, source, "ps", "--quiet", "--status", "running")
+	if err != nil {
+		return err
+	}
+	if ids := strings.Fields(string(running.stdout)); len(ids) > 0 {
+		// Unpause everything, even after a partial pause or a cancelled copy.
+		defer func() {
+			unpauseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancel()
+			if _, unpauseErr := d.Command(unpauseCtx, append([]string{"unpause"}, ids...)...); unpauseErr != nil {
+				err = errors.Join(err, fmt.Errorf("resume application %q after copying its volumes: %w", source.Name, unpauseErr))
+			}
+		}()
+		if _, err := d.Command(ctx, append([]string{"pause"}, ids...)...); err != nil {
+			return fmt.Errorf("pause application %q to copy its volumes: %w", source.Name, err)
+		}
+	}
+	args := []string{"run", "--rm", "--network", "none", "--entrypoint", "sh"}
+	for _, volume := range volumes {
+		args = append(args,
+			"--mount", "type=volume,source="+volumeName(source, volume)+",target=/from/"+volume+",readonly",
+			"--mount", "type=volume,source="+volumeName(target, volume)+",target=/to/"+volume)
+	}
+	args = append(args, d.CopyImage, "-c", copyVolumesScript)
+	if _, err := d.Command(ctx, args...); err != nil {
+		return fmt.Errorf("copy volumes of application %q: %w", source.Name, err)
+	}
+	return nil
 }
 
 func (d *Docker) compose(ctx context.Context, app model.App, args ...string) (commandResult, error) {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install or upgrade site-deploy on this host. Run as root with the new binary;
-# site-deploy.service must sit next to this script. deploy/upgrade.sh copies
-# both here and runs:
+# site-deploy.service must sit next to this script. `site-deploy upgrade`
+# copies all three to a temporary directory here and runs:
 #
 #   sudo ./install-host.sh ./site-deploy
 #

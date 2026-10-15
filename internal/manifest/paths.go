@@ -295,6 +295,23 @@ func HostMounts(data []byte) ([]HostMount, error) {
 	return mounts, nil
 }
 
+// NamedVolumes lists the top-level named volumes, sorted, in a Compose file
+// written by Prepare. Docker names each PROJECT_NAME.
+func NamedVolumes(data []byte) ([]string, error) {
+	var document struct {
+		Volumes map[string]any `json:"volumes"`
+	}
+	if err := json.Unmarshal(data, &document); err != nil {
+		return nil, fmt.Errorf("decode Compose file: %w", err)
+	}
+	volumes := make([]string, 0, len(document.Volumes))
+	for name := range document.Volumes {
+		volumes = append(volumes, name)
+	}
+	sort.Strings(volumes)
+	return volumes, nil
+}
+
 func shortMount(text, where string) (map[string]any, error) {
 	if strings.ContainsAny(text, "$\x00\\") {
 		return nil, fmt.Errorf("%s must use explicit Unix paths; interpolation is not supported here", where)

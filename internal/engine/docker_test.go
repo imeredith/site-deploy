@@ -453,3 +453,87 @@ func TestCommandUsesHostAndControlledEnvironment(t *testing.T) {
 		t.Fatal("truncated output accepted")
 	}
 }
+
+func TestCopyVolumesPausesOnlyForTheCopyAndCleansUpFailures(t *testing.T) {
+	source, target := testApp(t, ""), testApp(t, "")
+	source.Name, source.Project = "main", "site-main"
+	target.Name, target.Project = "preview", "site-preview"
+	for _, test := range []struct {
+		name    string
+		fail    string // the first argument of the call that fails
+		missing bool   // the copy image is not present yet
+		want    []string
+	}{
+		{"copies", "", true, []string{"image inspect", "pull", "site-preview create", "site-main ps", "pause a1 b2", "run", "unpause a1 b2"}},
+		{"copy fails", "run", false, []string{"image inspect", "site-preview create", "site-main ps", "pause a1 b2", "run", "unpause a1 b2", "site-preview down", "volume rm"}},
+		{"pause fails", "pause", false, []string{"image inspect", "site-preview create", "site-main ps", "pause a1 b2", "unpause a1 b2", "site-preview down", "volume rm"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			docker := New("docker", "unix:///run/test-docker.sock")
+			var calls []string
+			var run []string
+			docker.run = func(ctx context.Context, invocation command) (commandResult, error) {
+				args := invocation.args[2:] // after --host HOST
+				var call string
+				if args[0] == "compose" {
+					project := args[4]
+					args = args[11:]
+					call = project + " " + args[0]
+				} else {
+					call = strings.Join(args[:2], " ")
+					switch args[0] {
+					case "pause", "unpause":
+						call = strings.Join(args, " ")
+					case "pull", "run":
+						call = args[0]
+					}
+				}
+				calls = append(calls, call)
+				if args[0] == "run" {
+					run = args
+				}
+				if call == "image inspect" && test.missing {
+					return commandResult{}, errors.New("no such image")
+				}
+				if args[0] == test.fail {
+					return commandResult{}, errors.New("failed")
+				}
+				if call == "site-main ps" {
+					return commandResult{stdout: []byte("a1\nb2\n")}, nil
+				}
+				return commandResult{}, nil
+			}
+			err := docker.CopyVolumes(context.Background(), source, target, []string{"data", "uploads"})
+			if (err != nil) != (test.fail != "") {
+				t.Fatalf("error %v", err)
+			}
+			if !reflect.DeepEqual(calls, test.want) {
+				t.Fatalf("calls\n%q\nwant\n%q", calls, test.want)
+			}
+			if test.fail == "pause" {
+				return
+			}
+			want := []string{"run", "--rm", "--network", "none", "--entrypoint", "sh",
+				"--mount", "type=volume,source=site-main_data,target=/from/data,readonly",
+				"--mount", "type=volume,source=site-preview_data,target=/to/data",
+				"--mount", "type=volume,source=site-main_uploads,target=/from/uploads,readonly",
+				"--mount", "type=volume,source=site-preview_uploads,target=/to/uploads",
+				DefaultCopyImage, "-c", copyVolumesScript}
+			if !reflect.DeepEqual(run, want) {
+				t.Fatalf("run %q", run)
+			}
+		})
+	}
+}
+
+func TestExistingVolumesMatchesExactNames(t *testing.T) {
+	app := testApp(t, "")
+	docker := New("docker", "")
+	docker.run = func(_ context.Context, invocation command) (commandResult, error) {
+		return commandResult{stdout: []byte("site-example_data\nsite-example_data2\nother_cache\n")}, nil
+	}
+	existing, err := docker.ExistingVolumes(context.Background(), app, []string{"data", "cache"})
+	if err != nil || !reflect.DeepEqual(existing, []string{"site-example_data"}) {
+		t.Fatalf("existing %q %v", existing, err)
+	}
+}

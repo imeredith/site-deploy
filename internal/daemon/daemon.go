@@ -44,8 +44,11 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	interval := flags.Duration("idle-scan", 5*time.Second, "idle application scan interval")
 	caddyAdmin := flags.String("caddy-admin", "", "dedicated Caddy admin URL; enables complete configuration replacement")
 	httpOnly := flags.Bool("http", false, "configure Caddy for HTTP on port 80 instead of automatic HTTPS")
+	tlsCertDir := flags.String("tls-cert-dir", "", "folder of .pem files, each a certificate chain and its key, that Caddy serves instead of obtaining certificates for the names they cover; a path as Caddy sees it")
+	tlsInternal := flags.Bool("tls-internal", false, "serve HTTPS with certificates from Caddy's local CA, which browsers do not trust, instead of public ACME certificates (for hosts public challenges cannot reach)")
 	registryAddr := flags.String("registry", "", "loopback address for the private image registry, such as 127.0.0.1:9082 (empty disables it)")
 	registryImage := flags.String("registry-image", "registry:3", "image that runs the private registry")
+	copyImage := flags.String("volume-copy-image", engine.DefaultCopyImage, "image that copies named volumes for deploy --copy-volumes-from (needs sh, find, and cp -a)")
 	registryGrace := flags.Duration("registry-grace", 24*time.Hour, "keep unused registry tags this long after their push")
 	pruneImages := flags.Bool("prune-images", false, "remove Docker images that no container uses (only on a host whose Docker is dedicated to site-deploy)")
 	cleanupInterval := flags.Duration("cleanup-interval", time.Hour, "how often to remove unused images")
@@ -68,6 +71,23 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	}
 	if *interval <= 0 {
 		return errors.New("idle-scan must be positive")
+	}
+	caddyMode := caddy.HTTPS
+	switch {
+	case *httpOnly && *tlsInternal:
+		return errors.New("http and tls-internal are mutually exclusive")
+	case *httpOnly:
+		caddyMode = caddy.HTTP
+	case *tlsInternal:
+		caddyMode = caddy.InternalHTTPS
+	}
+	var certFolders []string
+	if *tlsCertDir != "" {
+		certFolders = []string{*tlsCertDir}
+		// Checked now rather than at the first sync, which exits with a less obvious error.
+		if _, err := caddy.Config(nil, "127.0.0.1:9080", caddyMode, certFolders...); err != nil {
+			return fmt.Errorf("tls-cert-dir: %w", err)
+		}
 	}
 	if *cleanupInterval <= 0 || *registryGrace < 0 {
 		return errors.New("cleanup-interval must be positive and registry-grace nonnegative")
@@ -121,6 +141,10 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	}
 	defer proxyListener.Close()
 	docker := engine.New(*dockerBinary, *dockerHost)
+	if *copyImage == "" {
+		return errors.New("volume-copy-image must not be empty")
+	}
+	docker.CopyImage = *copyImage
 	manager, err := orchestrator.New(root, docker, hostPaths)
 	if err != nil {
 		return err
@@ -149,7 +173,7 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		}
 		syncMu.Lock()
 		defer syncMu.Unlock()
-		config, err := caddy.Config(manager.Sites(), proxyListener.Addr().String(), *httpOnly)
+		config, err := caddy.Config(manager.Sites(), proxyListener.Addr().String(), caddyMode, certFolders...)
 		if err != nil {
 			return err
 		}
