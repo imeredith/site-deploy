@@ -38,10 +38,12 @@ jobs:
             echo "exists=true" >>"$GITHUB_OUTPUT"
           fi
 
+      # The current Go, with its security fixes, as local builds and the action's fallback use;
+      # go.mod's version is only the oldest that compiles it.
       - if: steps.version.outputs.exists != 'true'
         uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: stable
 
       - if: steps.version.outputs.exists != 'true'
         run: make check
