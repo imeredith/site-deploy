@@ -45,11 +45,13 @@ runs:
   using: composite
   steps:
     # Any Go from 1.21 on fetches the toolchain go.mod asks for, so a runner's
-    # own Go is enough and stays the one later steps see.
+    # own Go is enough and stays the one later steps see. Without one, `go`
+    # fails the pipeline, which `shell: bash` runs under -e -o pipefail, so the
+    # failure is ignored here and setup-go installs Go.
     - id: go
       shell: bash
       run: |
-        minor=$(go env GOVERSION 2>/dev/null | sed -nE 's/^go1\.([0-9]+).*/\1/p')
+        minor=$(go env GOVERSION 2>/dev/null | sed -nE 's/^go1\.([0-9]+).*/\1/p' || true)
         if [ "${minor:-0}" -ge 21 ]; then echo found=true >> "$GITHUB_OUTPUT"; fi
     - if: steps.go.outputs.found != 'true'
       uses: actions/setup-go@v7
