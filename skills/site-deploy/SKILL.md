@@ -110,7 +110,7 @@ Do this only when the user asks for a site-deploy change or release. The procedu
 
 1. Make and test the change in the site-deploy checkout: `make check`. If engine or Compose handling changed, also run the Docker integration test on the servers (README, "Scope and validation"). It namespaces and cleans up after itself.
 2. Bump `VERSION` (semver). `site-deploy upgrade` installs only a version newer than the host's, which keeps the "CLI ≥ daemon" rule meaningful.
-3. Commit and push to GitHub first if any host is deployed to by the GitHub Action (README "GitHub Actions"). The action builds its CLI from the ref workflows use, normally `main`, so a daemon newer than that makes those workflows fail with 426.
+3. Commit and push to GitHub first if any host is deployed to by the GitHub Action (README "GitHub Actions"). The action takes its CLI from the ref workflows use, normally `main`: the release for its `VERSION`, which pushing a `VERSION` bump to `main` publishes, or a build from source until that exists. A daemon newer than that makes those workflows fail with 426.
 4. Run `make upgrade HOST=NAME` in the checkout. It installs the local CLI **first** (`make install-cli`, which also installs Linux server builds for amd64 and arm64), then runs `site-deploy upgrade NAME`, which installs the CLI's own version as the host's daemon:
    - It installs only a newer version than the host runs. If the host is up to date it says so and does nothing.
    - It refuses a CLI older than the repository's latest (`VERSION` on `main`), and warns when the CLI is newer, that is, not pushed yet (see step 3).

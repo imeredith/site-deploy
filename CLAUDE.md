@@ -15,7 +15,9 @@ update `SKILL.md`, `references/bundle-format.md` and `scripts/bundle.sh` in the 
 
 - Bump `VERSION` (semver) for any change you install. `site-deploy upgrade` installs only a newer version than the host's,
   and refuses a CLI older than the repository's `VERSION` on `main`, unless `--force`.
-- The GitHub Action (`action.yml`, README "GitHub Actions") builds the CLI from the ref workflows use, normally `main`.
+- The GitHub Action (`action.yml`, README "GitHub Actions") uses the CLI released for `VERSION` on the ref workflows use,
+  normally `main`, or builds it from source until that release exists. A `VERSION` bump on `main` publishes release
+  `vVERSION` (`.github/workflows/release.yml`); a published release is never replaced.
   Push to GitHub before upgrading a daemon that CI deploys to, or those workflows get HTTP 426. `upgrade` warns when the
   CLI is newer than the repository.
 - `make check` (tests + vet) before releasing. For engine/Compose changes, also run the Docker integration test on

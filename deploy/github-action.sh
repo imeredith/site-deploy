@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Run by action.yml. Builds the CLI from this checkout, so it always matches
-# the action's ref. The SSH key, known_hosts and token go under RUNNER_TEMP,
-# which the runner empties at the start and end of every job. Then it
+# Run by action.yml. Uses the released CLI for the action's VERSION, which
+# github-action-release.sh downloaded, or else builds it from this checkout, so
+# it always matches the action's ref. The SSH key, known_hosts and token go
+# under RUNNER_TEMP, which the runner empties at the start and end of every
+# job. Then it
 # optionally pushes images and deploys a bundle. Later steps in the job can run
 # site-deploy directly.
 #
@@ -29,13 +31,19 @@ rm -rf "$state"
 mkdir -p "$state/bin"
 chmod 700 "$state"
 
-echo "::group::Build site-deploy $(cat "$root/VERSION")"
-# Same build as make build, written straight to RUNNER_TEMP so jobs sharing
-# this action's directory on a self-hosted runner never race.
-CGO_ENABLED=0 go build -C "$root" -trimpath \
-	-ldflags "-X site-deploy/internal/version.Version=$(cat "$root/VERSION")" \
-	-o "$state/bin/site-deploy" ./cmd/site-deploy
-echo "::endgroup::"
+if [ -n "${RELEASED_CLI:-}" ]; then
+	# Downloaded and checked against its release's SHA256SUMS.
+	install -m 0755 "$RELEASED_CLI" "$state/bin/site-deploy"
+	echo "Using the released $("$state/bin/site-deploy" version)"
+else
+	echo "::group::Build site-deploy $(cat "$root/VERSION")"
+	# Same build as make build, written straight to RUNNER_TEMP so jobs sharing
+	# this action's directory on a self-hosted runner never race.
+	CGO_ENABLED=0 go build -C "$root" -trimpath \
+		-ldflags "-X site-deploy/internal/version.Version=$(cat "$root/VERSION")" \
+		-o "$state/bin/site-deploy" ./cmd/site-deploy
+	echo "::endgroup::"
+fi
 
 (
 	umask 077

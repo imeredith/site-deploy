@@ -326,7 +326,7 @@ On the server itself, or through a tunnel you manage, `--server URL` bypasses ho
 
 ## GitHub Actions
 
-[`action.yml`](action.yml) deploys from a workflow through the same kind of SSH tunnel as a [host](#hosts). It builds the CLI from the action's own source, so the CLI always matches the ref you use. It packages the bundle directory with [`bundle.sh`](skills/site-deploy/scripts/bundle.sh), optionally pushes images first, and replaces an existing deployment of the same name (`delete` then `deploy`, so there is a brief outage).
+[`action.yml`](action.yml) deploys from a workflow through the same kind of SSH tunnel as a [host](#hosts). It uses the CLI [released](#versions-and-upgrades) for the action's `VERSION`, or builds it from the action's own source while there's no release for it, so the CLI always matches the ref you use. It packages the bundle directory with [`bundle.sh`](skills/site-deploy/scripts/bundle.sh), optionally pushes images first, and replaces an existing deployment of the same name (`delete` then `deploy`, so there is a brief outage).
 
 On the server, give CI its own SSH user and key. The key only has to forward ports to the control API and the registry, so restrict it in that user's `~/.ssh/authorized_keys`:
 
@@ -365,13 +365,15 @@ jobs:
 
 Inputs: `host`, `ssh-key`, `known-hosts` and `token` are required. `name` is the application, and leaving it empty only installs and configures `site-deploy` for later steps. `bundle` defaults to `.`. Set `replace: false` to fail instead of replacing an existing application. `push` takes one `LOCAL_IMAGE NAME:TAG` per line, and `registry-port` defaults to `9082`. The output `domain` is the deployed application's domain. Later steps in the same job can run `site-deploy` directly, for example `site-deploy logs my-site`.
 
-The key, known hosts and token are written under `RUNNER_TEMP`, which the runner empties at the start and end of each job. Host keys missing from `known-hosts` are refused. The action uses the runner's Go when it is 1.21 or newer, and otherwise installs Go with `actions/setup-go`.
+The key, known hosts and token are written under `RUNNER_TEMP`, which the runner empties at the start and end of each job. Host keys missing from `known-hosts` are refused. On Linux and macOS runners, amd64 or arm64, the action downloads the released CLI and checks it against the release's `SHA256SUMS`, so it needs no Go. A download that doesn't match fails the step. Otherwise it builds the CLI, with the runner's Go when it is 1.21 or newer, or else after installing Go with `actions/setup-go`. A copy of the action checked out into the workspace and run as a local action always builds.
 
 The daemon rejects CLIs older than itself, and the action's CLI comes from the ref a workflow names. With `@main`, push this repository to GitHub before upgrading a daemon that CI deploys to. A workflow pinned to an older tag needs a newer one once the daemon passes it.
 
 ## Versions and upgrades
 
 `VERSION` holds the release version. `make build` stamps it, plus the commit as build metadata (`0.1.0+abc1234`, with `.dirty` for uncommitted changes). Metadata does not affect ordering. Bump `VERSION` for every build you install on a server.
+
+**Releases:** when a `VERSION` bump reaches `main`, the [Release workflow](.github/workflows/release.yml) runs `make check`, builds static CLIs for Linux and macOS on amd64 and arm64, and publishes them as GitHub release `vVERSION` with a `SHA256SUMS` file. The [GitHub Action](#github-actions) uses them. A published release is never replaced, so a new build needs a new `VERSION`.
 
 **The CLI must be at least as new as the daemon.** A release daemon reports its version in the `X-Site-Deploy-Version` header of authenticated responses and at `GET /v1/version`. Every other endpoint requires the `X-Site-Deploy-Client-Version` request header. If that version is missing, older than the daemon's, or `dev`, the daemon returns `426 Upgrade Required` before doing anything, so an outdated CLI can never apply a change. `site-deploy daemon-version` prints both versions and exits with status 1 if this CLI is too old. A `dev` daemon accepts any CLI for local development.
 
@@ -389,7 +391,7 @@ make upgrade HOST=NAME            # both steps
 Before installing, it compares three versions, ignoring build metadata:
 
 - **The installed daemon's.** It installs only a newer version. When the host already runs this version it says so and does nothing. When the host runs a newer one it refuses: update the CLI first.
-- **The repository's latest**, `VERSION` on the `main` branch of the GitHub repository (`SITE_DEPLOY_VERSION_URL` overrides the address). A CLI older than that is refused: update the checkout and run `make install-cli`. A newer CLI, not pushed yet, gets a warning, because workflows using the [GitHub Action](#github-actions) build their CLI from the repository and a newer daemon refuses it (HTTP 426). If the repository can't be reached, it warns and carries on.
+- **The repository's latest**, `VERSION` on the `main` branch of the GitHub repository (`SITE_DEPLOY_VERSION_URL` overrides the address). A CLI older than that is refused: update the checkout and run `make install-cli`. A newer CLI, not pushed yet, gets a warning, because workflows using the [GitHub Action](#github-actions) take their CLI from the repository and a newer daemon refuses it (HTTP 426). If the repository can't be reached, it warns and carries on.
 - `--force` installs anyway: to reinstall the same version, downgrade, or install a CLI older than the repository's.
 
 The server binary is the CLI itself when the server has the same CPU architecture, and otherwise the build that `make install-cli` puts in `PREFIX/lib/site-deploy/linux-ARCH/` (`--binary FILE` names another). It must be a Linux build of the CLI's exact version for the server's architecture, which the CLI reads from the binary's Go build information. The CLI sends it, the unit and [`deploy/install-host.sh`](deploy/install-host.sh) to the server through the host's remote shell in one SSH session, and runs the script with `sudo`. The SSH user needs passwordless sudo. `SITE_DEPLOY_SSH` (with `SITE_DEPLOY_RSH`) works in place of a configured host. `install-host.sh` also performs first installs, after which `upgrade` saves the new daemon's token as the host's token. It:

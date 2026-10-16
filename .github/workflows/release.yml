@@ -1,0 +1,71 @@
+name: Release
+
+# Publishes release v<VERSION> with static CLI builds whenever a VERSION bump reaches main. The
+# GitHub Action (action.yml) downloads the build for its own VERSION and the runner's platform, so
+# workflows deploy without Go or a compile. Until the release exists, the action builds from source.
+
+on:
+  push:
+    branches: [main]
+    paths: [VERSION]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(cat VERSION)
+          [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] ||
+            { echo "::error::VERSION is not a semver version: $version"; exit 1; }
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          # A release is never replaced: workflows may already have downloaded it.
+          if gh release view "v$version" >/dev/null 2>&1; then
+            echo "v$version is already released"
+            echo "exists=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.version.outputs.exists != 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - if: steps.version.outputs.exists != 'true'
+        run: make check
+
+      # Same flags as the Makefile's builds, with the commit as build metadata.
+      - name: Build
+        if: steps.version.outputs.exists != 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          build=$VERSION+${GITHUB_SHA::7}
+          for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            CGO_ENABLED=0 GOOS=${platform%/*} GOARCH=${platform#*/} go build -trimpath \
+              -ldflags "-X site-deploy/internal/version.Version=$build" \
+              -o "dist/site-deploy-${platform/\//-}" ./cmd/site-deploy
+          done
+          (cd dist && sha256sum site-deploy-* >SHA256SUMS && cat SHA256SUMS)
+          "dist/site-deploy-linux-amd64" version
+
+      - name: Publish
+        if: steps.version.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "v$VERSION" dist/* --target "$GITHUB_SHA" --title "site-deploy $VERSION" \
+            --notes "Static CLI builds of site-deploy $VERSION. The GitHub Action downloads the one for its runner's platform and checks it against SHA256SUMS."
