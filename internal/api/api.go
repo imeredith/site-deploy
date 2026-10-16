@@ -23,13 +23,17 @@ import (
 	"site-deploy/internal/orchestrator"
 	"site-deploy/internal/store"
 	"site-deploy/internal/version"
+	"site-deploy/internal/volumes"
 )
 
 const (
 	maxUploadBytes = 100 << 20
 	syncTimeout    = 15 * time.Second
 	deleteTimeout  = 70 * time.Second
-	warningHeader  = "X-Site-Deploy-Warning"
+	// volumeDeleteTimeout bounds deleting a volume or snapshot, which may have
+	// to remove every file in it.
+	volumeDeleteTimeout = 10 * time.Minute
+	warningHeader       = "X-Site-Deploy-Warning"
 )
 
 type handler struct {
@@ -136,6 +140,20 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			h.json(w, http.StatusOK, h.images.Cleanup(r.Context()))
 		}
+		return
+	case "/v1/volumes":
+		if h.method(w, r, http.MethodGet) {
+			list, err := h.manager.ListVolumes()
+			if err != nil {
+				h.error(w, errorStatus(err), err)
+				return
+			}
+			h.json(w, http.StatusOK, list)
+		}
+		return
+	}
+	if rest, found := strings.CutPrefix(path, "/v1/volumes/"); found {
+		h.volume(w, r, strings.Split(rest, "/"))
 		return
 	}
 	if !strings.HasPrefix(path, "/v1/apps/") {
@@ -305,6 +323,77 @@ func (h *handler) delete(w http.ResponseWriter, r *http.Request, name string) {
 	h.json(w, http.StatusOK, map[string]string{"deleted": name})
 }
 
+// volume serves /v1/volumes/NAME (POST creates, DELETE deletes),
+// /v1/volumes/NAME/rekey (POST), and /v1/volumes/NAME/snapshots/APP (DELETE).
+func (h *handler) volume(w http.ResponseWriter, r *http.Request, parts []string) {
+	if _, err := query(r); err != nil {
+		h.error(w, http.StatusBadRequest, err)
+		return
+	}
+	name := parts[0]
+	if !store.ValidName(name) {
+		h.error(w, http.StatusBadRequest, errors.New("volume name must start with a lowercase letter and contain at most 48 lowercase letters, digits, or hyphens"))
+		return
+	}
+	// Deletion may take a while, and stopping halfway helps nobody: finish it
+	// even if the caller disconnects.
+	deleteContext := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.WithoutCancel(r.Context()), volumeDeleteTimeout)
+	}
+	switch {
+	case len(parts) == 1:
+		switch r.Method {
+		case http.MethodPost:
+			volume, key, err := h.manager.CreateVolume(r.Context(), name)
+			if err != nil {
+				h.error(w, errorStatus(err), err)
+				return
+			}
+			w.Header().Set("Location", "/v1/volumes/"+name)
+			h.json(w, http.StatusCreated, struct {
+				volumes.Volume
+				Key string `json:"key"`
+			}{volume, key})
+		case http.MethodDelete:
+			ctx, cancel := deleteContext()
+			defer cancel()
+			if err := h.manager.DeleteVolume(ctx, name); err != nil {
+				h.error(w, errorStatus(err), err)
+				return
+			}
+			h.json(w, http.StatusOK, map[string]string{"deleted": name})
+		default:
+			h.method(w, r, http.MethodPost, http.MethodDelete)
+		}
+	case len(parts) == 2 && parts[1] == "rekey":
+		if h.method(w, r, http.MethodPost) {
+			key, err := h.manager.RekeyVolume(name)
+			if err != nil {
+				h.error(w, errorStatus(err), err)
+				return
+			}
+			h.json(w, http.StatusOK, map[string]string{"name": name, "key": key})
+		}
+	case len(parts) == 3 && parts[1] == "snapshots" && parts[2] != "":
+		app := parts[2]
+		if !store.ValidName(app) {
+			h.error(w, http.StatusBadRequest, errors.New("application name must start with a lowercase letter and contain at most 48 lowercase letters, digits, or hyphens"))
+			return
+		}
+		if h.method(w, r, http.MethodDelete) {
+			ctx, cancel := deleteContext()
+			defer cancel()
+			if err := h.manager.DeleteVolumeSnapshot(ctx, name, app); err != nil {
+				h.error(w, errorStatus(err), err)
+				return
+			}
+			h.json(w, http.StatusOK, map[string]string{"volume": name, "snapshot": app})
+		}
+	default:
+		h.error(w, http.StatusNotFound, errors.New("endpoint not found"))
+	}
+}
+
 func (h *handler) registry(w http.ResponseWriter, r *http.Request) {
 	if h.images == nil || h.images.Address() == "" {
 		h.error(w, http.StatusNotFound, errors.New("this daemon has no private registry (serve --registry)"))
@@ -442,13 +531,13 @@ func withoutSecrets(app model.App) model.App {
 
 func errorStatus(err error) int {
 	switch {
-	case errors.Is(err, orchestrator.ErrNotFound):
+	case errors.Is(err, orchestrator.ErrNotFound), errors.Is(err, orchestrator.ErrNoVolumes), errors.Is(err, volumes.ErrNotFound):
 		return http.StatusNotFound
-	case errors.Is(err, orchestrator.ErrConflict), errors.Is(err, orchestrator.ErrBusy):
+	case errors.Is(err, orchestrator.ErrConflict), errors.Is(err, orchestrator.ErrBusy), errors.Is(err, volumes.ErrExists), errors.Is(err, volumes.ErrInUse):
 		return http.StatusConflict
 	case errors.Is(err, orchestrator.ErrUnavailable):
 		return http.StatusServiceUnavailable
-	case errors.Is(err, orchestrator.ErrInvalid):
+	case errors.Is(err, orchestrator.ErrInvalid), errors.Is(err, volumes.ErrKey):
 		return http.StatusBadRequest
 	case errors.Is(err, context.DeadlineExceeded):
 		return http.StatusGatewayTimeout

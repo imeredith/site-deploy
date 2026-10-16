@@ -96,6 +96,16 @@ func (p Policy) Validate(dataDir, dockerSocket string) error {
 	return nil
 }
 
+// Overlapping returns a rule whose path contains path or lies inside it.
+func (p Policy) Overlapping(path string) (Rule, bool) {
+	for _, rule := range p {
+		if within(rule.Path, path) || within(path, rule.Path) {
+			return rule, true
+		}
+	}
+	return Rule{}, false
+}
+
 // Check returns the clean form of source if app may bind-mount it, read-only
 // or not. The path must exist without a symlink in any component and must be a
 // regular file or directory, so it can't name a device or socket.

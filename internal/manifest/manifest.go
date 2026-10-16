@@ -37,6 +37,12 @@ type HostPathCheck func(source string, readOnly bool) (string, error)
 // directory into place before starting the project. Bind mounts of absolute
 // host paths need hostPath's approval; with a nil hostPath they're rejected.
 func Prepare(directory string, hostPath HostPathCheck) (model.Spec, string, error) {
+	return PrepareWith(directory, Checks{HostPath: hostPath})
+}
+
+// PrepareWith is Prepare with checks for everything a bundle may mount from
+// outside itself: host paths, and site-deploy volumes from x-site-deploy.
+func PrepareWith(directory string, checks Checks) (model.Spec, string, error) {
 	var empty model.Spec
 	directory, err := filepath.Abs(directory)
 	if err != nil {
@@ -85,8 +91,18 @@ func Prepare(directory string, hostPath HostPathCheck) (model.Spec, string, erro
 	if err != nil {
 		return empty, "", err
 	}
-	v := validator{root: directory, document: doc, spec: spec, hostPath: hostPath}
+	var mounts []volumeMount
+	if value, exists := doc["x-site-deploy"].(map[string]any)["volumes"]; exists {
+		if mounts, err = volumeMounts(value, spec.Service); err != nil {
+			return empty, "", err
+		}
+	}
+	v := validator{root: directory, document: doc, spec: spec, hostPath: checks.HostPath}
 	if err := v.validate(); err != nil {
+		return empty, "", err
+	}
+	// Last, so a volume is only snapshotted for an otherwise valid bundle.
+	if err := v.mountVolumes(mounts, checks.Volume); err != nil {
 		return empty, "", err
 	}
 	delete(doc, "x-site-deploy")
@@ -164,7 +180,7 @@ func deploymentSpec(value any) (model.Spec, error) {
 	if err != nil {
 		return spec, err
 	}
-	if err := allowedKeys(m, "x-site-deploy", "domain service port idle_timeout start_timeout suspend_mode basic_auth"); err != nil {
+	if err := allowedKeys(m, "x-site-deploy", "domain service port idle_timeout start_timeout suspend_mode basic_auth volumes"); err != nil {
 		return spec, err
 	}
 	for name, target := range map[string]*string{

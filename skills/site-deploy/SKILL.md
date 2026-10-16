@@ -42,6 +42,11 @@ If it fails:
 | `site-deploy push LOCAL_IMAGE NAME:TAG` | Push a local dependencies image to the private registry. Prints the `image:` line to use |
 | `site-deploy images` | Registry contents, push times, and the apps using each image |
 | `site-deploy cleanup` | Remove unused registry tags and Docker images now (it also runs hourly and after each delete) |
+| `site-deploy volume list` | Site-deploy volumes, their snapshots, and the apps mounting each (daemon 0.9.0+). See "Shared data" |
+| `site-deploy volume create NAME` | Makes an empty volume and prints its path and key. **The key is shown only this once** |
+| `site-deploy volume rekey NAME` | Replaces the key and prints the new one. Deployed apps keep their mounts |
+| `site-deploy volume delete-snapshot NAME APP` | Deletes APP's snapshot, once APP itself is deleted |
+| `site-deploy volume delete NAME` | Deletes a volume no app mounts and with no snapshots left |
 | `site-deploy caddy-config --http` | The routing config site-deploy pushes to Caddy |
 
 Names must start with a lowercase letter and contain at most 48 lowercase letters, digits, or hyphens. App states are `starting`, `running`, `stopping`, `suspended`, `deleting`, and `error`.
@@ -74,10 +79,20 @@ Because delete is destructive and visible to users, confirm with the user before
 
 ## Previews with real data
 
-`deploy NAME bundle.zip --copy-volumes-from APP` starts a new app, such as a pull-request preview, with copies of APP's named volumes. Each volume the bundle declares under the same name as one of APP's is copied before the first start; the rest start empty. APP is paused while the copy runs, so the copy is consistent, and its requests wait rather than fail. The README has the details ("Starting with another application's data").
+`deploy NAME bundle.zip --copy-volumes-from APP` starts a new app, such as a pull-request preview, with copies of APP's named volumes. For large shared datasets, snapshots of a site-deploy volume are usually better (see "Shared data"). Each volume the bundle declares under the same name as one of APP's is copied before the first start; the rest start empty. APP is paused while the copy runs, so the copy is consistent, and its requests wait rather than fail. The README has the details ("Starting with another application's data").
 
 - **First deploy only.** The copy never overwrites: if NAME's volume already exists, for example kept by an earlier `delete`, deploy refuses. To refresh a preview's data, delete the preview, remove its volume on the server (`site-deploy ssh -- docker volume rm PROJECT_VOLUME`, with the project from `inspect`), and deploy again with the option. Confirm with the user first, since that discards the preview's own data. Never remove volumes of the app you are copying from.
 - **It's production data in a preview.** Accounts, password hashes, API tokens and the app's own secrets come along, so keep previews behind basic auth. Anything the app does by itself with that data also comes along: scheduled jobs, crawls, emails, Slack or webhook notifications. Check for those before copying, and turn them off for the copy (usually an environment variable in the preview's compose file) so a preview doesn't act on real users' behalf. If the app signs tokens with keys stored in its data, give the copy new keys: a preview runs unreviewed code, and tokens it signs with production's keys may be valid on production.
+
+## Shared data: site-deploy volumes
+
+On a server started with `--volumes-dir` (daemon 0.9.0+), site-deploy volumes are btrfs directories that exist apart from any app. A bundle mounts one from `x-site-deploy.volumes` with the volume's key: either the volume itself, or, with `snapshot: true`, the app's own writable snapshot. `references/bundle-format.md` example 6 has the format. Prefer them over `--copy-volumes-from` for large datasets that many apps or previews start from: a snapshot is instant whatever the size, and it shares disk space until it changes.
+
+- **If `volume list` says volumes aren't enabled**, the server's operator has to add `--volumes-dir` on a btrfs filesystem (README, "Site-deploy volumes"). Tell the user rather than changing the server yourself.
+- **Keys:** `volume create` prints the key once. The bundle needs it, so give it to the user and put it where they want it (the compose file, or a CI secret written into it). A lost key means `volume rekey`, which leaves deployed apps mounted but makes every later deploy need the new key.
+- **Filling a volume** means writing to the path `volume create` printed, as root on the server, or deploying an app that mounts it read-write. Ask before doing either.
+- **Snapshots outlive their apps.** A snapshot is made on the app's first deploy, named after the app, and remounted by every redeploy under that name. `delete` keeps it. When a preview is finished, also run `volume delete-snapshot NAME APP`. To give a preview fresh data, delete it, delete its snapshot, and deploy again. Both discard the preview's changes, so confirm with the user first.
+- **Deletes are refused while in use:** a volume while any app mounts it or snapshots remain, a snapshot while its app is deployed.
 
 ## Behaviour worth knowing
 

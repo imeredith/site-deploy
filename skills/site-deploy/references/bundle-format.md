@@ -8,7 +8,7 @@ A bundle is a ZIP whose **root** contains exactly one of `compose.yaml`, `compos
 - [x-site-deploy](#x-site-deploy)
 - [What the validator allows](#what-the-validator-allows)
 - [Getting code into a container without building](#getting-code-into-a-container-without-building)
-- [Examples](#examples): static site, Node app with data, app + Postgres, password-protected site, compiled app on a dependencies-only image
+- [Examples](#examples): static site, Node app with data, app + Postgres, password-protected site, compiled app on a dependencies-only image, preview on a snapshot of a shared dataset
 - [Limits](#limits)
 
 ## x-site-deploy
@@ -24,6 +24,13 @@ x-site-deploy:
   basic_auth:             # optional (daemon 0.2.0+); omit for a public site
     - user: preview
       hash: $2a$14$...    # bcrypt hash, written as-is (no $$ escaping)
+  volumes:                # optional (daemon 0.9.0+); site-deploy volumes, see example 6
+    corpus:               # the volume's name, from site-deploy volume create
+      key: sdv_3f9c...    # required; the key volume create printed
+      target: /corpus     # required; absolute path in the container
+      read_only: true     # default false
+      snapshot: true      # default false (the volume itself); true = this app's own snapshot
+      service: web        # default: the service above
 ```
 
 ## What the validator allows
@@ -38,6 +45,10 @@ x-site-deploy:
   relying on one. A refused mount fails the deploy and names the allowed paths.
 - **Named volumes and networks** must be project-owned: no `external`, no custom `name:`. Volume driver `local`
   only, network driver `bridge` only. Named volumes are where persistent data belongs, because they survive delete/redeploy.
+- **Site-deploy volumes** (daemon 0.9.0+, on servers started with `--volumes-dir`) are mounted only from
+  `x-site-deploy.volumes`, with the volume's key; a bind mount of their path is refused like any host path. The
+  target must not already be mounted in that service. A wrong key, a missing volume, or a server without volumes
+  fails the deploy and names the entry.
 - **No custom resource names:** `container_name` is not a supported key.
 - **Ports:** any uploaded `ports:` are replaced. Only the routed service gets an ephemeral `127.0.0.1` port.
   Services talk to each other by service name on the Compose network.
@@ -245,6 +256,45 @@ services:
 volumes:
   data: {}
 ```
+
+### 6. Preview on a snapshot of a shared dataset
+
+Site-deploy volumes (daemon 0.9.0+) hold data that several apps share, independent of any of them, such as a large
+corpus. The server needs `--volumes-dir` (`site-deploy volume list` says if it doesn't), and the volume is made once
+with `site-deploy volume create corpus`, which prints its key a single time. Production mounts the volume itself;
+each preview mounts its own snapshot, so the same bundle works for both apart from `snapshot`:
+
+```yaml
+x-site-deploy:
+  domain: pr12.example.com
+  service: web
+  port: 8080
+  basic_auth:
+    - user: preview
+      hash: $2a$14$...
+  volumes:
+    corpus:
+      key: sdv_3f9c...e1       # from volume create; rekey replaces it
+      target: /corpus
+      read_only: true          # omit to let the app write to its snapshot
+      snapshot: true           # production leaves this out and mounts the volume itself
+
+services:
+  web:
+    image: 127.0.0.1:9082/docs-app:2026-10-15
+    init: true
+    environment:
+      CONTENT_DIR: /corpus
+```
+
+- **The snapshot is made on the app's first deploy** and named after the app. It's instant and shares disk space with
+  the volume until either changes. Redeploys (delete + deploy, same name) mount the same snapshot, changes included,
+  and later changes to the volume don't reach it.
+- **Deleting the app keeps its snapshot.** When a preview is gone for good, run
+  `site-deploy volume delete-snapshot corpus pr12` after `site-deploy delete pr12`. For fresh data, do the same and
+  deploy again.
+- **Filling the volume** happens on the server, as root, at the path `volume create` printed (or through an app that
+  mounts it read-write). It's not part of a bundle.
 
 ## Limits
 

@@ -73,6 +73,7 @@ services:
 | `start_timeout` | Deadline for starting the project and reaching its HTTP port; default `60s`. |
 | `suspend_mode` | `stop` releases memory and is the default. Optional `pause` retains allocated memory. |
 | `basic_auth` | Optional list of `{user, hash}` accounts. Caddy then requires HTTP basic authentication for this domain. See below. |
+| `volumes` | Optional [site-deploy volumes](#site-deploy-volumes) to mount, each with its key. |
 
 ### Basic authentication
 
@@ -143,6 +144,49 @@ The rules:
 
 A writable host path gives the container's users, often root, write access to that directory on the host. Allow only directories that nothing else on the host trusts, and don't give one application write access to a tree that another application mounts paths inside. The checks refuse a symlink that a container plants there, but a swap between the check and Docker's mount can't be ruled out.
 
+### Site-deploy volumes
+
+A named volume belongs to one application. A site-deploy volume (daemon 0.9.0+) is a btrfs subvolume that exists apart from any deployment. Applications that have its key can mount the volume itself, or their own snapshot of it. A pull-request preview, for example, can start from a snapshot of a large dataset. Taking it is instant whatever the size, and the preview keeps its changes to itself across redeploys.
+
+The operator enables volumes with a directory on a btrfs filesystem, then creates them. `volume create` prints the volume's key once:
+
+```sh
+site-deploy serve --data-dir /var/lib/site-deploy --volumes-dir /srv/site-deploy-volumes
+site-deploy volume create corpus     # prints the path and the key
+```
+
+A bundle mounts a volume from `x-site-deploy`, so the same bundle can be deployed as production and as previews:
+
+```yaml
+x-site-deploy:
+  domain: pr12.example.com
+  service: web
+  port: 8080
+  volumes:
+    corpus:                  # the volume's name
+      key: sdv_3f9c...e1     # as printed by volume create
+      target: /corpus        # where it appears in the container
+      read_only: true        # default false
+      snapshot: true         # default false, which mounts the volume itself
+      service: web           # default: the routed service
+```
+
+- **The key** is checked when the bundle is deployed. The daemon stores only its SHA-256, so `volume create` shows it once, and `volume rekey` replaces it. Deployed applications keep their mounts after a rekey; deploying again needs the new key. Anyone who can deploy controls the server anyway, so the key guards against mounting a volume by mistake or from an unrelated bundle, not against the operator.
+- **Without `snapshot`**, the application mounts the volume itself. Its writes are seen by every application that mounts the volume, and by snapshots taken later.
+- **With `snapshot: true`**, the application mounts its own writable snapshot, made on its first deploy and named after the application. Snapshots are atomic, and share disk space with the volume until either side changes. Deleting the application keeps its snapshot, so redeploying it (`delete`, then `deploy` with the same name) mounts the same snapshot, changes included. For a fresh snapshot, delete the application, then run `volume delete-snapshot corpus APP`, and deploy again.
+- **Filling a volume:** `volume create` and `volume list` print its path. Its root directory is owned by root with mode `0755`. Write into it as root on the server, for example `sudo cp -a /srv/corpus/. PATH/`, or deploy an application that mounts it read-write. A container that runs as another user needs the directory `chown`ed to that user first. Snapshots keep owners and modes.
+- **Every start checks the mounts again.** The volume or snapshot must still exist as a btrfs subvolume, reached without symlinks, and an application may mount only its own snapshot. Otherwise the start fails with an error, as for host paths.
+- **Deleting:** `volume delete` refuses while a deployed application mounts the volume or snapshots of it remain. `volume delete-snapshot` refuses while its application is deployed.
+
+```sh
+site-deploy volume list                          # volumes, snapshots, and the apps mounting them
+site-deploy volume rekey corpus
+site-deploy volume delete-snapshot corpus pr12  # after site-deploy delete pr12
+site-deploy volume delete corpus
+```
+
+Each volume is a directory in the volumes directory, holding `volume.json` (the key's hash), `data` (the volume) and `snapshots/APP`. The daemon creates the volumes directory with mode `0700` if it's missing. At startup it refuses one that isn't on btrfs, goes through a symlink, or overlaps the data directory, the Docker socket's directory or a `--host-path` entry. Btrfs operations run in a short-lived container as root, because the daemon's own user can't snapshot or delete subvolumes holding files that containers wrote as other users. That container runs the `--volume-copy-image` image (`busybox:1.37`), with only the volumes directory and the daemon's executable mounted, so the executable must be static, as `make build` makes it. Back up the volumes directory separately, for example with `btrfs send`: the upgrade backups cover only the data directory. Daemons older than 0.9.0 reject bundles with `volumes`, and rolling a daemon back below 0.9.0 stops the applications that mount volumes, because it sees their mounts as host paths nobody allowed.
+
 ## CLI
 
 Commands contact the daemon; Docker only needs to be installed on the deployment host.
@@ -160,6 +204,8 @@ Commands contact the daemon; Docker only needs to be installed on the deployment
 ./bin/site-deploy --token-file .site-deploy/token push my-deps:local my-deps:2026-10-13
 ./bin/site-deploy --token-file .site-deploy/token images
 ./bin/site-deploy --token-file .site-deploy/token cleanup
+./bin/site-deploy --token-file .site-deploy/token volume create corpus
+./bin/site-deploy --token-file .site-deploy/token volume list
 ```
 
 Common options include `--host`, `--server`, `--token-file`, `--token`, and `--json`; flags can appear before or after the command (before `host` and `ssh`). From a workstation, commands normally go to a configured [host](#hosts). `SITE_DEPLOY_HOST`, `SITE_DEPLOY_SERVER`, `SITE_DEPLOY_TOKEN_FILE`, and `SITE_DEPLOY_TOKEN` also configure the client. The default token file is `.site-deploy/token`; prefer it to putting a token in shell history. `--timeout` controls the entire upload/request deadline and defaults to `10m`. Names start with a lowercase letter and contain at most 48 lowercase letters, digits, or hyphens.
@@ -368,7 +414,7 @@ If the newer release had migrated the data format, also restore the archive take
 
 ## Scope and validation
 
-This is a trusted-operator, single-host system. The API token authorizes Docker deployments; deploy only trusted bundles and images. It does not provide hostile-tenant isolation. The Compose validator restricts host mounts to the operator's `--host-path` allowlist, and restricts namespaces, privileged mode, image builds, external resources, custom resource names, and unsupported Compose keys. Use image-based services, bundle-local files, allowed host paths, and project-owned volumes/networks. ZIP extraction rejects traversal, symlinks, special files, duplicate paths, and excessive expansion. Limits are 100 MiB per upload, 10,000 extracted paths, 128 MiB per file, and 512 MiB expanded total.
+This is a trusted-operator, single-host system. The API token authorizes Docker deployments; deploy only trusted bundles and images. It does not provide hostile-tenant isolation. The Compose validator restricts host mounts to the operator's `--host-path` allowlist and to site-deploy volumes whose key the bundle gives, and restricts namespaces, privileged mode, image builds, external resources, custom resource names, and unsupported Compose keys. Use image-based services, bundle-local files, allowed host paths, and project-owned volumes/networks. ZIP extraction rejects traversal, symlinks, special files, duplicate paths, and excessive expansion. Limits are 100 MiB per upload, 10,000 extracted paths, 128 MiB per file, and 512 MiB expanded total.
 
 Run unit tests and static checks without creating Docker resources:
 
@@ -383,6 +429,6 @@ The real Docker/Caddy lifecycle test is explicitly opt-in:
 SITE_DEPLOY_INTEGRATION=1 go test -tags integration -v ./internal/integration
 ```
 
-It requires Linux, a working Docker socket, Compose, and access to the test images. Defaults are `node:24-bookworm-slim` and `caddy:2`; override them with `SITE_DEPLOY_TEST_IMAGE` and `SITE_DEPLOY_TEST_CADDY_IMAGE`. Each run uses a random namespace, temporary directories, and dynamically allocated ports, and removes only resources that it owns so concurrent agents' deployments remain separate.
+It requires Linux, a working Docker socket, Compose, and access to the test images. Defaults are `node:24-bookworm-slim` and `caddy:2`; override them with `SITE_DEPLOY_TEST_IMAGE` and `SITE_DEPLOY_TEST_CADDY_IMAGE`. The site-deploy volumes test also needs `SITE_DEPLOY_TEST_BTRFS_DIR`, a directory on btrfs, where it makes and removes its own volumes directory; without it, that test is skipped. The same variable enables the btrfs package's unit test, which needs no Docker or root: `SITE_DEPLOY_TEST_BTRFS_DIR=DIR go test ./internal/btrfs`. Each run uses a random namespace, temporary directories, and dynamically allocated ports, and removes only resources that it owns so concurrent agents' deployments remain separate.
 
 See [architecture and lifecycle details](docs/architecture.md).

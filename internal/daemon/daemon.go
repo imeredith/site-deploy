@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -22,6 +23,7 @@ import (
 
 	"site-deploy/internal/api"
 	"site-deploy/internal/auth"
+	"site-deploy/internal/btrfs"
 	"site-deploy/internal/caddy"
 	"site-deploy/internal/engine"
 	"site-deploy/internal/gateway"
@@ -29,6 +31,7 @@ import (
 	"site-deploy/internal/images"
 	"site-deploy/internal/orchestrator"
 	"site-deploy/internal/version"
+	"site-deploy/internal/volumes"
 )
 
 func Run(args []string, stdout, stderr io.Writer) error {
@@ -48,7 +51,8 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	tlsInternal := flags.Bool("tls-internal", false, "serve HTTPS with certificates from Caddy's local CA, which browsers do not trust, instead of public ACME certificates (for hosts public challenges cannot reach)")
 	registryAddr := flags.String("registry", "", "loopback address for the private image registry, such as 127.0.0.1:9082 (empty disables it)")
 	registryImage := flags.String("registry-image", "registry:3", "image that runs the private registry")
-	copyImage := flags.String("volume-copy-image", engine.DefaultCopyImage, "image that copies named volumes for deploy --copy-volumes-from (needs sh, find, and cp -a)")
+	copyImage := flags.String("volume-copy-image", engine.DefaultCopyImage, "image that copies named volumes for deploy --copy-volumes-from (needs sh, find, and cp -a); it also runs the btrfs helper for --volumes-dir")
+	volumesDir := flags.String("volumes-dir", "", "btrfs directory for site-deploy volumes, which bundles mount, or mount snapshots of, with a key (empty disables them)")
 	registryGrace := flags.Duration("registry-grace", 24*time.Hour, "keep unused registry tags this long after their push")
 	pruneImages := flags.Bool("prune-images", false, "remove Docker images that no container uses (only on a host whose Docker is dedicated to site-deploy)")
 	cleanupInterval := flags.Duration("cleanup-interval", time.Hour, "how often to remove unused images")
@@ -111,6 +115,11 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	if err := hostPaths.Validate(root, strings.TrimPrefix(*dockerHost, "unix://")); err != nil {
 		return err
 	}
+	if *volumesDir != "" {
+		if err := checkVolumesDir(*volumesDir, root, strings.TrimPrefix(*dockerHost, "unix://"), hostPaths); err != nil {
+			return err
+		}
+	}
 	for _, rule := range hostPaths {
 		fmt.Fprintf(stderr, "Allowing host path %s\n", rule)
 	}
@@ -145,7 +154,25 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		return errors.New("volume-copy-image must not be empty")
 	}
 	docker.CopyImage = *copyImage
-	manager, err := orchestrator.New(root, docker, hostPaths)
+	var managerOptions []orchestrator.Option
+	if *volumesDir != "" {
+		executable, err := helperExecutable()
+		if err != nil {
+			return err
+		}
+		subvolumes, err := engine.NewSubvolumes(docker, *volumesDir, executable)
+		if err != nil {
+			return fmt.Errorf("volumes-dir: %w", err)
+		}
+		volumeStore, err := volumes.Open(*volumesDir, subvolumes)
+		if err != nil {
+			return err
+		}
+		defer volumeStore.Close()
+		managerOptions = append(managerOptions, orchestrator.WithVolumes(volumeStore))
+		fmt.Fprintf(stderr, "Site-deploy volumes in %s\n", *volumesDir)
+	}
+	manager, err := orchestrator.New(root, docker, hostPaths, managerOptions...)
 	if err != nil {
 		return err
 	}
@@ -247,6 +274,72 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	<-imagesDone
 	<-caddyDone
 	return err
+}
+
+// checkVolumesDir creates the volumes directory if needed, then checks that it
+// is a real btrfs directory that no host-path rule reaches, so its volumes,
+// snapshots and keys can only be mounted the way site-deploy allows.
+func checkVolumesDir(dir, dataDir, dockerSocket string, hostPaths hostpaths.Policy) error {
+	if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir || strings.ContainsAny(dir, ",\"\n:$\\") {
+		return fmt.Errorf("volumes-dir %q must be a clean absolute path without ',', ':', '$', quotes or '\\'", dir)
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("volumes-dir: %w", err)
+	}
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return fmt.Errorf("volumes-dir: %w", err)
+	}
+	if resolved != dir {
+		return fmt.Errorf("volumes-dir %s goes through a symlink; use %s", dir, resolved)
+	}
+	data, err := filepath.EvalSymlinks(dataDir)
+	if err != nil {
+		return fmt.Errorf("resolve data directory: %w", err)
+	}
+	if overlaps(dir, data) {
+		return fmt.Errorf("volumes-dir %s overlaps the data directory %s", dir, data)
+	}
+	if socketDir, err := filepath.EvalSymlinks(filepath.Dir(dockerSocket)); err == nil && overlaps(dir, socketDir) {
+		return fmt.Errorf("volumes-dir %s overlaps the Docker socket's directory %s", dir, socketDir)
+	}
+	if rule, found := hostPaths.Overlapping(dir); found {
+		return fmt.Errorf("host path %s overlaps volumes-dir %s, which would let apps mount volumes without their keys", rule.Path, dir)
+	}
+	onBtrfs, err := btrfs.OnBtrfs(dir)
+	if err != nil {
+		return fmt.Errorf("volumes-dir: %w", err)
+	}
+	if !onBtrfs {
+		return fmt.Errorf("volumes-dir %s is not on a btrfs filesystem", dir)
+	}
+	return nil
+}
+
+func overlaps(a, b string) bool {
+	return a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/") || a == "/" || b == "/"
+}
+
+// helperExecutable is this program's path, for the btrfs helper container,
+// which runs it without the host's shared libraries.
+func helperExecutable() (string, error) {
+	info, ok := debug.ReadBuildInfo()
+	static := false
+	if ok {
+		for _, setting := range info.Settings {
+			if setting.Key == "CGO_ENABLED" && setting.Value == "0" {
+				static = true
+			}
+		}
+	}
+	if !static {
+		return "", errors.New("volumes-dir runs this executable in a helper container, so it must be built statically: CGO_ENABLED=0, as make build does")
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("find this executable for the btrfs helper: %w", err)
+	}
+	return filepath.EvalSymlinks(executable)
 }
 
 func loopbackAddress(address string) error {

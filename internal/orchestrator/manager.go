@@ -23,6 +23,7 @@ import (
 	"site-deploy/internal/manifest"
 	"site-deploy/internal/model"
 	"site-deploy/internal/store"
+	"site-deploy/internal/volumes"
 )
 
 var (
@@ -75,6 +76,7 @@ type Manager struct {
 	runtime       engine.Runtime
 	store         *store.Store
 	hostPaths     hostpaths.Policy
+	volumes       *volumes.Store // nil without site-deploy volumes
 	removeFiles   func(string) error
 	mu            sync.RWMutex
 	apps          map[string]*entry
@@ -90,10 +92,16 @@ type Manager struct {
 	imagesMu sync.RWMutex
 }
 
+// Option configures optional manager features.
+type Option func(*Manager)
+
+// WithVolumes enables site-deploy volumes, which bundles mount with a key.
+func WithVolumes(store *volumes.Store) Option { return func(m *Manager) { m.volumes = store } }
+
 // New loads saved applications and reconciles them with Docker. hostPaths is
 // the allowlist for bind mounts of host paths; a running application whose
 // mounts it no longer allows is stopped.
-func New(dataDir string, runtime engine.Runtime, hostPaths hostpaths.Policy) (*Manager, error) {
+func New(dataDir string, runtime engine.Runtime, hostPaths hostpaths.Policy, options ...Option) (*Manager, error) {
 	if runtime == nil {
 		return nil, errors.New("Docker runtime is required")
 	}
@@ -111,6 +119,9 @@ func New(dataDir string, runtime engine.Runtime, hostPaths hostpaths.Policy) (*M
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{directory: dir, runtime: runtime, store: disk, hostPaths: hostPaths, removeFiles: os.RemoveAll, apps: map[string]*entry{}, domains: map[string]*entry{}, ctx: ctx, cancel: cancel}
+	for _, option := range options {
+		option(m)
+	}
 	fail := func(err error) (*Manager, error) { cancel(); disk.Close(); return nil, err }
 	if err := disk.CheckFormat(); err != nil {
 		return fail(err)
@@ -359,9 +370,15 @@ func (m *Manager) DeployWith(ctx context.Context, name, zipPath string, opts Dep
 	if _, err := os.Lstat(filepath.Join(staging, "compose.generated.json")); !errors.Is(err, os.ErrNotExist) {
 		return model.App{}, fmt.Errorf("%w: compose.generated.json is reserved for generated deployment configuration", ErrInvalid)
 	}
-	spec, generated, err := manifest.Prepare(staging, func(source string, readOnly bool) (string, error) {
+	checks := manifest.Checks{HostPath: func(source string, readOnly bool) (string, error) {
 		return m.hostPaths.Check(name, source, readOnly)
-	})
+	}}
+	if m.volumes != nil {
+		checks.Volume = func(volume, key string, snapshot bool) (string, error) {
+			return m.volumes.Source(ctx, volume, key, name, snapshot)
+		}
+	}
+	spec, generated, err := manifest.PrepareWith(staging, checks)
 	if err != nil {
 		return model.App{}, fmt.Errorf("%w: validate Compose: %v", ErrInvalid, err)
 	}
@@ -635,9 +652,10 @@ func (m *Manager) startLocked(e *entry, initial bool, seed *volumeSeed) (*operat
 }
 
 // checkHostPaths checks the project's host-path bind mounts against the
-// current allowlist. Docker resolves them again at every container start, so a
-// tree changed by a container since the deploy, or an entry the operator has
-// since removed, stops the start.
+// current allowlist, and its site-deploy volumes against the volumes that
+// exist. Docker resolves them again at every container start, so a tree
+// changed by a container since the deploy, an entry the operator has since
+// removed, or a deleted volume or snapshot stops the start.
 func (m *Manager) checkHostPaths(app model.App) error {
 	data, err := os.ReadFile(app.ComposeFile)
 	if err != nil {
@@ -648,6 +666,12 @@ func (m *Manager) checkHostPaths(app model.App) error {
 		return err
 	}
 	for _, mount := range mounts {
+		if m.volumes != nil && m.volumes.Contains(mount.Source) {
+			if err := m.volumes.Check(app.Name, mount.Source); err != nil {
+				return fmt.Errorf("service %s: %w", mount.Service, err)
+			}
+			continue
+		}
 		if _, err := m.hostPaths.Check(app.Name, mount.Source, mount.ReadOnly); err != nil {
 			return fmt.Errorf("service %s: %w", mount.Service, err)
 		}

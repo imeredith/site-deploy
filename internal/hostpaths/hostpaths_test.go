@@ -160,3 +160,20 @@ func TestCheck(t *testing.T) {
 		t.Errorf("empty policy: %v", err)
 	}
 }
+
+func TestOverlappingFindsRulesAboveAndBelow(t *testing.T) {
+	policy := Policy{{Path: "/srv/media"}, {Path: "/data/volumes/corpus"}}
+	for path, want := range map[string]string{
+		"/srv/media":       "/srv/media",
+		"/srv/media/films": "/srv/media",
+		"/data/volumes":    "/data/volumes/corpus",
+		"/data":            "/data/volumes/corpus",
+		"/srv/mediaother":  "",
+		"/data/other":      "",
+	} {
+		rule, found := policy.Overlapping(path)
+		if found != (want != "") || rule.Path != want {
+			t.Errorf("Overlapping(%s) = %v %v; want %q", path, rule, found, want)
+		}
+	}
+}

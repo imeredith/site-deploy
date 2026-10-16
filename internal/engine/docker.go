@@ -250,10 +250,8 @@ func (d *Docker) CopyVolumes(ctx context.Context, source, target model.App, volu
 		return errors.New("no volumes to copy")
 	}
 	// Pull first, so the source is paused only for the copy itself.
-	if _, inspectErr := d.Command(ctx, "image", "inspect", "--format", "{{.Id}}", d.CopyImage); inspectErr != nil {
-		if _, err := d.Command(ctx, "pull", "--quiet", d.CopyImage); err != nil {
-			return fmt.Errorf("pull %s to copy volumes: %w", d.CopyImage, err)
-		}
+	if err := d.ensureImage(ctx, d.CopyImage); err != nil {
+		return fmt.Errorf("pull %s to copy volumes: %w", d.CopyImage, err)
 	}
 	// Compose creates the volumes itself, labelled as the project's own, which
 	// later starts expect. It also creates the containers, without starting them.
@@ -308,6 +306,15 @@ func (d *Docker) CopyVolumes(ctx context.Context, source, target model.App, volu
 		return fmt.Errorf("copy volumes of application %q: %w", source.Name, err)
 	}
 	return nil
+}
+
+// ensureImage pulls image unless Docker already has it.
+func (d *Docker) ensureImage(ctx context.Context, image string) error {
+	if _, err := d.Command(ctx, "image", "inspect", "--format", "{{.Id}}", image); err == nil {
+		return nil
+	}
+	_, err := d.Command(ctx, "pull", "--quiet", image)
+	return err
 }
 
 func (d *Docker) compose(ctx context.Context, app model.App, args ...string) (commandResult, error) {

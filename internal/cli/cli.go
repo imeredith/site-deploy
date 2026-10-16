@@ -24,6 +24,7 @@ import (
 	"site-deploy/internal/model"
 	"site-deploy/internal/store"
 	"site-deploy/internal/version"
+	"site-deploy/internal/volumes"
 )
 
 // Serve is set by the executable to avoid coupling the client to the daemon.
@@ -70,6 +71,12 @@ Commands:
                                  Push a local Docker image to the daemon's private registry
   images                         List images in the private registry and the apps using them
   cleanup                        Remove unused registry tags and Docker images now
+  volume create NAME             Create a site-deploy volume and print its key, shown only once
+  volume list                    List volumes, their snapshots, and the apps mounting them
+  volume rekey NAME              Replace a volume's key and print the new one
+  volume delete NAME             Delete a volume that no app mounts and that has no snapshots
+  volume delete-snapshot NAME APP
+                                 Delete APP's snapshot of a volume, once APP is deleted
   upgrade [HOST] [--check] [--force] [--binary FILE]
                                  Install this CLI's version as the host's daemon, over SSH,
                                  if it is newer than the installed one and not older than
@@ -274,6 +281,11 @@ func parse(args []string) (options, error) {
 	case "inspect", "suspend", "resume", "delete", "logs":
 		want = 1
 	case "list", "caddy-config", "version", "daemon-version", "images", "cleanup":
+	case "volume":
+		if err := validVolumeCommand(opts.positionals); err != nil {
+			return opts, err
+		}
+		want = len(opts.positionals)
 	case "upgrade":
 		if len(opts.positionals) > 1 {
 			return opts, errors.New("upgrade expects at most one host name")
@@ -318,10 +330,35 @@ func parse(args []string) (options, error) {
 		}
 		return opts, nil
 	}
+	if opts.command == "volume" {
+		return opts, nil
+	}
 	if want > 0 && !store.ValidName(opts.positionals[0]) {
 		return opts, errors.New("application name must start with a lowercase letter and contain at most 48 lowercase letters, digits, or hyphens")
 	}
 	return opts, nil
+}
+
+// validVolumeCommand checks a volume subcommand and its arguments.
+func validVolumeCommand(args []string) error {
+	arguments := map[string]int{"create": 1, "list": 0, "rekey": 1, "delete": 1, "delete-snapshot": 2}
+	if len(args) == 0 {
+		return errors.New("volume expects create NAME, list, rekey NAME, delete NAME, or delete-snapshot NAME APP")
+	}
+	want, ok := arguments[args[0]]
+	if !ok || len(args) != want+1 {
+		return errors.New("volume expects create NAME, list, rekey NAME, delete NAME, or delete-snapshot NAME APP")
+	}
+	for i, name := range args[1:] {
+		if !store.ValidName(name) {
+			kind := "volume"
+			if i == 1 {
+				kind = "application"
+			}
+			return fmt.Errorf("%s name %q must start with a lowercase letter and contain at most 48 lowercase letters, digits, or hyphens", kind, name)
+		}
+	}
+	return nil
 }
 
 func (opts options) validHost() error {
@@ -358,6 +395,10 @@ func runClient(opts *options, stdout, stderr io.Writer) error {
 		switch opts.command {
 		case "deploy", "delete", "suspend", "resume", "push", "cleanup":
 			fmt.Fprintf(stderr, "Host: %s\n", opts.hostLabel)
+		case "volume":
+			if opts.positionals[0] != "list" {
+				fmt.Fprintf(stderr, "Host: %s\n", opts.hostLabel)
+			}
 		}
 		t, err := openTunnel(*conn.ssh, opts.command == "push")
 		if err != nil {
@@ -377,7 +418,7 @@ func runClient(opts *options, stdout, stderr io.Writer) error {
 	query := url.Values{}
 	var body io.Reader
 	var size int64
-	if len(opts.positionals) > 0 && opts.command != "push" {
+	if len(opts.positionals) > 0 && opts.command != "push" && opts.command != "volume" {
 		path += "/" + url.PathEscape(opts.positionals[0])
 	}
 	switch opts.command {
@@ -416,6 +457,19 @@ func runClient(opts *options, stdout, stderr io.Writer) error {
 		path = "/v1/registry"
 	case "cleanup":
 		path, method = "/v1/cleanup", http.MethodPost
+	case "volume":
+		path = "/v1/volumes"
+		args := opts.positionals
+		switch args[0] {
+		case "create":
+			path, method = path+"/"+args[1], http.MethodPost
+		case "rekey":
+			path, method = path+"/"+args[1]+"/rekey", http.MethodPost
+		case "delete":
+			path, method = path+"/"+args[1], http.MethodDelete
+		case "delete-snapshot":
+			path, method = path+"/"+args[1]+"/snapshots/"+args[2], http.MethodDelete
+		}
 	}
 	endpoint.Path, endpoint.RawQuery = path, query.Encode()
 	request, err := http.NewRequest(method, endpoint.String(), body)
@@ -441,6 +495,12 @@ func runClient(opts *options, stdout, stderr io.Writer) error {
 			return err
 		}
 		fmt.Fprintf(stderr, "Copying named volumes from %s, which is paused while they copy\n", opts.copyVolumesFrom)
+	}
+	if opts.command == "volume" {
+		// Older daemons answer with a bare "endpoint not found".
+		if err := requireDaemon(client, *endpoint, opts.token, volumesVersion, "site-deploy volumes"); err != nil {
+			return err
+		}
 	}
 	response, err := client.Do(request)
 	if err != nil {
@@ -480,6 +540,9 @@ func runClient(opts *options, stdout, stderr io.Writer) error {
 
 // copyVolumesVersion is the first daemon version with deploy --copy-volumes-from.
 const copyVolumesVersion = "0.7.0"
+
+// volumesVersion is the first daemon version with site-deploy volumes.
+const volumesVersion = "0.9.0"
 
 // requireDaemon fails unless the daemon is at least minimum, for features that
 // older daemons would silently ignore rather than refuse. Dev builds pass.
@@ -674,6 +737,8 @@ func printResult(stdout io.Writer, opts options, data []byte) error {
 			return errors.New("control API returned an invalid cleanup report")
 		}
 		return printCleanup(stdout, report)
+	case "volume":
+		return printVolume(stdout, opts.positionals, data)
 	case "logs":
 		var result struct {
 			Logs *string `json:"logs"`
@@ -700,6 +765,63 @@ func printResult(stdout io.Writer, opts options, data []byte) error {
 		_, err := fmt.Fprintf(stdout, "%s: %s (%s)\n", diagnostic(app.Name, ""), diagnostic(string(app.State), ""), diagnostic(app.Spec.Domain, ""))
 		return err
 	}
+}
+
+func printVolume(stdout io.Writer, args []string, data []byte) error {
+	switch args[0] {
+	case "list":
+		var list []volumes.Volume
+		if err := json.Unmarshal(data, &list); err != nil {
+			return errors.New("control API returned an invalid volume list")
+		}
+		table := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(table, "NAME\tPATH\tSNAPSHOTS\tUSED BY")
+		for _, volume := range list {
+			snapshots, users := []string{}, []string{}
+			for _, snapshot := range volume.Snapshots {
+				snapshots = append(snapshots, snapshot.App)
+			}
+			for _, use := range volume.UsedBy {
+				if use.Snapshot {
+					users = append(users, use.App+" (snapshot)")
+				} else {
+					users = append(users, use.App)
+				}
+			}
+			fmt.Fprintf(table, "%s\t%s\t%s\t%s\n", diagnostic(volume.Name, ""), diagnostic(volume.Path, ""), orNone(snapshots), orNone(users))
+		}
+		return table.Flush()
+	case "create", "rekey":
+		var result struct {
+			Name string `json:"name"`
+			Path string `json:"path"`
+			Key  string `json:"key"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil || result.Name == "" || result.Key == "" {
+			return errors.New("control API returned an invalid volume key")
+		}
+		name, key := diagnostic(result.Name, ""), diagnostic(result.Key, "")
+		if args[0] == "create" {
+			fmt.Fprintf(stdout, "Created volume %s at %s\n", name, diagnostic(result.Path, ""))
+		} else {
+			fmt.Fprintf(stdout, "Replaced the key of volume %s. Deployed apps keep their mounts; deploying again needs the new key.\n", name)
+		}
+		_, err := fmt.Fprintf(stdout, "Key (shown only now): %s\nMount it from a bundle with:\n  x-site-deploy:\n    volumes:\n      %s:\n        key: %s\n        target: /data\n", key, name, key)
+		return err
+	case "delete":
+		_, err := fmt.Fprintf(stdout, "Deleted volume %s\n", diagnostic(args[1], ""))
+		return err
+	default:
+		_, err := fmt.Fprintf(stdout, "Deleted %s's snapshot of volume %s\n", diagnostic(args[2], ""), diagnostic(args[1], ""))
+		return err
+	}
+}
+
+func orNone(items []string) string {
+	if len(items) == 0 {
+		return "-"
+	}
+	return diagnostic(strings.Join(items, ", "), "")
 }
 
 func printCleanup(stdout io.Writer, report images.Report) error {
