@@ -11,8 +11,7 @@ import (
 
 func TestCLIVolumeCommands(t *testing.T) {
 	cliTestEnvironment(t)
-	const key = "sdv_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	daemon := "0.9.0"
+	daemon := "0.10.0"
 	var request string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/version" {
@@ -24,9 +23,7 @@ func TestCLIVolumeCommands(t *testing.T) {
 		case "GET /v1/volumes":
 			io.WriteString(w, `[{"name":"corpus","path":"/srv/volumes/corpus/data","snapshots":[{"app":"pr1","path":"/srv/volumes/corpus/snapshots/pr1"}],"used_by":[{"app":"main","snapshot":false},{"app":"pr1","snapshot":true}]},{"name":"empty","path":"/srv/volumes/empty/data","snapshots":[],"used_by":[]}]`)
 		case "POST /v1/volumes/corpus":
-			fmt.Fprintf(w, `{"name":"corpus","path":"/srv/volumes/corpus/data","key":%q}`, key)
-		case "POST /v1/volumes/corpus/rekey":
-			fmt.Fprintf(w, `{"name":"corpus","key":%q}`, key)
+			io.WriteString(w, `{"name":"corpus","path":"/srv/volumes/corpus/data","snapshots":[],"used_by":[]}`)
 		case "DELETE /v1/volumes/corpus":
 			io.WriteString(w, `{"deleted":"corpus"}`)
 		case "DELETE /v1/volumes/corpus/snapshots/pr1":
@@ -44,8 +41,7 @@ func TestCLIVolumeCommands(t *testing.T) {
 		request, want string
 	}{
 		{[]string{"volume", "list"}, "GET /v1/volumes", "corpus  /srv/volumes/corpus/data  pr1        main, pr1 (snapshot)\nempty   /srv/volumes/empty/data   -          -"},
-		{[]string{"volume", "create", "corpus"}, "POST /v1/volumes/corpus", "Created volume corpus at /srv/volumes/corpus/data\nKey (shown only now): " + key + "\n"},
-		{[]string{"volume", "rekey", "corpus"}, "POST /v1/volumes/corpus/rekey", "Replaced the key of volume corpus."},
+		{[]string{"volume", "create", "corpus"}, "POST /v1/volumes/corpus", "Created volume corpus at /srv/volumes/corpus/data\nMount it from a bundle with:\n  x-site-deploy:\n    volumes:\n      corpus:\n        target: /data\n"},
 		{[]string{"volume", "delete", "corpus"}, "DELETE /v1/volumes/corpus", "Deleted volume corpus\n"},
 		{[]string{"volume", "delete-snapshot", "corpus", "pr1"}, "DELETE /v1/volumes/corpus/snapshots/pr1", "Deleted pr1's snapshot of volume corpus\n"},
 	} {
@@ -55,14 +51,16 @@ func TestCLIVolumeCommands(t *testing.T) {
 			t.Errorf("%q: code=%d request=%q stdout=%q stderr=%q", test.args, code, request, stdout, stderr)
 		}
 	}
-	if code, stdout, _ := run("volume", "create", "corpus", "--json"); code != 0 || !strings.Contains(stdout, `"key": "`+key+`"`) {
+	if code, stdout, _ := run("volume", "create", "corpus", "--json"); code != 0 || !strings.Contains(stdout, `"path": "/srv/volumes/corpus/data"`) {
 		t.Errorf("create --json: code=%d stdout=%q", code, stdout)
 	}
 
-	// Older daemons don't have the endpoints, so the CLI explains instead.
-	daemon, request = "0.8.1", ""
-	if code, _, stderr := run("volume", "list"); code != 1 || request != "" || !strings.Contains(stderr, "site-deploy volumes needs daemon 0.9.0 or newer") {
-		t.Errorf("old daemon: code=%d request=%q stderr=%q", code, request, stderr)
+	// Older daemons don't have the endpoints, or, like 0.9.0, need keys, so the CLI explains instead.
+	for _, daemon = range []string{"0.8.1", "0.9.0"} {
+		request = ""
+		if code, _, stderr := run("volume", "list"); code != 1 || request != "" || !strings.Contains(stderr, "site-deploy volumes needs daemon 0.10.0 or newer") {
+			t.Errorf("daemon %s: code=%d request=%q stderr=%q", daemon, code, request, stderr)
+		}
 	}
 
 	for _, args := range [][]string{
@@ -73,6 +71,7 @@ func TestCLIVolumeCommands(t *testing.T) {
 		{"volume", "delete-snapshot", "corpus"},
 		{"volume", "delete-snapshot", "corpus", "Pr1"},
 		{"volume", "format", "corpus"},
+		{"volume", "rekey", "corpus"},
 	} {
 		if code, _, _ := cliTestRun(args...); code != 2 {
 			t.Errorf("%q: code=%d, want 2", args, code)

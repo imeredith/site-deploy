@@ -146,16 +146,16 @@ A writable host path gives the container's users, often root, write access to th
 
 ### Site-deploy volumes
 
-A named volume belongs to one application. A site-deploy volume (daemon 0.9.0+) is a btrfs subvolume that exists apart from any deployment. Applications that have its key can mount the volume itself, or their own snapshot of it. A pull-request preview, for example, can start from a snapshot of a large dataset. Taking it is instant whatever the size, and the preview keeps its changes to itself across redeploys.
+A named volume belongs to one application. A site-deploy volume (daemon 0.10.0+) is a btrfs subvolume that exists apart from any deployment. Applications name it to mount the volume itself, or their own snapshot of it. A pull-request preview, for example, can start from a snapshot of a large dataset. Taking it is instant whatever the size, and the preview keeps its changes to itself across redeploys.
 
-The operator enables volumes with a directory on a btrfs filesystem, then creates them. `volume create` prints the volume's key once:
+The operator enables volumes with a directory on a btrfs filesystem, then creates them:
 
 ```sh
 site-deploy serve --data-dir /var/lib/site-deploy --volumes-dir /srv/site-deploy-volumes
-site-deploy volume create corpus     # prints the path and the key
+site-deploy volume create corpus     # prints its path
 ```
 
-A bundle mounts a volume from `x-site-deploy`, so the same bundle can be deployed as production and as previews:
+A bundle mounts a volume by name from `x-site-deploy`, so the same bundle can be deployed as production and as previews:
 
 ```yaml
 x-site-deploy:
@@ -164,14 +164,13 @@ x-site-deploy:
   port: 8080
   volumes:
     corpus:                  # the volume's name
-      key: sdv_3f9c...e1     # as printed by volume create
       target: /corpus        # where it appears in the container
       read_only: true        # default false
       snapshot: true         # default false, which mounts the volume itself
       service: web           # default: the routed service
 ```
 
-- **The key** is checked when the bundle is deployed. The daemon stores only its SHA-256, so `volume create` shows it once, and `volume rekey` replaces it. Deployed applications keep their mounts after a rekey; deploying again needs the new key. Anyone who can deploy controls the server anyway, so the key guards against mounting a volume by mistake or from an unrelated bundle, not against the operator.
+- **Any application can mount any volume** that exists. Creating a volume is what makes it available, and anyone who can deploy controls the server anyway. A bundle that names a missing volume fails to deploy.
 - **Without `snapshot`**, the application mounts the volume itself. Its writes are seen by every application that mounts the volume, and by snapshots taken later.
 - **With `snapshot: true`**, the application mounts its own writable snapshot, made on its first deploy and named after the application. Snapshots are atomic, and share disk space with the volume until either side changes. Deleting the application keeps its snapshot, so redeploying it (`delete`, then `deploy` with the same name) mounts the same snapshot, changes included. For a fresh snapshot, delete the application, then run `volume delete-snapshot corpus APP`, and deploy again.
 - **Filling a volume:** `volume create` and `volume list` print its path. Its root directory is owned by root with mode `0755`. Write into it as root on the server, for example `sudo cp -a /srv/corpus/. PATH/`, or deploy an application that mounts it read-write. A container that runs as another user needs the directory `chown`ed to that user first. Snapshots keep owners and modes.
@@ -180,12 +179,13 @@ x-site-deploy:
 
 ```sh
 site-deploy volume list                          # volumes, snapshots, and the apps mounting them
-site-deploy volume rekey corpus
-site-deploy volume delete-snapshot corpus pr12  # after site-deploy delete pr12
+site-deploy volume delete-snapshot corpus pr12   # after site-deploy delete pr12
 site-deploy volume delete corpus
 ```
 
-Each volume is a directory in the volumes directory, holding `volume.json` (the key's hash), `data` (the volume) and `snapshots/APP`. The daemon creates the volumes directory with mode `0700` if it's missing. At startup it refuses one that isn't on btrfs, goes through a symlink, or overlaps the data directory, the Docker socket's directory or a `--host-path` entry. Btrfs operations run in a short-lived container as root, because the daemon's own user can't snapshot or delete subvolumes holding files that containers wrote as other users. That container runs the `--volume-copy-image` image (`busybox:1.37`), with only the volumes directory and the daemon's executable mounted, so the executable must be static, as `make build` makes it. Back up the volumes directory separately, for example with `btrfs send`: the upgrade backups cover only the data directory. Daemons older than 0.9.0 reject bundles with `volumes`, and rolling a daemon back below 0.9.0 stops the applications that mount volumes, because it sees their mounts as host paths nobody allowed.
+Each volume is a directory in the volumes directory, holding `volume.json` (its creation time), `data` (the volume) and `snapshots/APP`. The daemon creates the volumes directory with mode `0700` if it's missing. At startup it refuses one that isn't on btrfs, goes through a symlink, or overlaps the data directory, the Docker socket's directory or a `--host-path` entry. Btrfs operations run in a short-lived container as root, because the daemon's own user can't snapshot or delete subvolumes holding files that containers wrote as other users. That container runs the `--volume-copy-image` image (`busybox:1.37`), with only the volumes directory and the daemon's executable mounted, so the executable must be static, as `make build` makes it. Back up the volumes directory separately, for example with `btrfs send`: the upgrade backups cover only the data directory.
+
+Daemon 0.9.0 had volumes too, but each one had a key that bundles had to give. 0.10.0 refuses a `key`, so remove it from bundles; volumes made by 0.9.0 keep working. Older daemons reject bundles with `volumes`, and rolling a daemon back below 0.9.0 stops the applications that mount volumes, because it sees their mounts as host paths nobody allowed.
 
 ## CLI
 
@@ -414,7 +414,7 @@ If the newer release had migrated the data format, also restore the archive take
 
 ## Scope and validation
 
-This is a trusted-operator, single-host system. The API token authorizes Docker deployments; deploy only trusted bundles and images. It does not provide hostile-tenant isolation. The Compose validator restricts host mounts to the operator's `--host-path` allowlist and to site-deploy volumes whose key the bundle gives, and restricts namespaces, privileged mode, image builds, external resources, custom resource names, and unsupported Compose keys. Use image-based services, bundle-local files, allowed host paths, and project-owned volumes/networks. ZIP extraction rejects traversal, symlinks, special files, duplicate paths, and excessive expansion. Limits are 100 MiB per upload, 10,000 extracted paths, 128 MiB per file, and 512 MiB expanded total.
+This is a trusted-operator, single-host system. The API token authorizes Docker deployments; deploy only trusted bundles and images. It does not provide hostile-tenant isolation. The Compose validator restricts host mounts to the operator's `--host-path` allowlist and to site-deploy volumes the operator created, and restricts namespaces, privileged mode, image builds, external resources, custom resource names, and unsupported Compose keys. Use image-based services, bundle-local files, allowed host paths, and project-owned volumes/networks. ZIP extraction rejects traversal, symlinks, special files, duplicate paths, and excessive expansion. Limits are 100 MiB per upload, 10,000 extracted paths, 128 MiB per file, and 512 MiB expanded total.
 
 Run unit tests and static checks without creating Docker resources:
 

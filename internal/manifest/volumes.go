@@ -9,10 +9,9 @@ import (
 	"site-deploy/internal/store"
 )
 
-// VolumeCheck authorizes a mount of the site-deploy volume name with key and
-// returns the host path to bind-mount: the volume itself, or with snapshot,
-// the application's own snapshot of it.
-type VolumeCheck func(name, key string, snapshot bool) (string, error)
+// VolumeCheck returns the host path that mounts the site-deploy volume name:
+// the volume itself, or with snapshot, the application's own snapshot of it.
+type VolumeCheck func(name string, snapshot bool) (string, error)
 
 // Checks approve what a bundle mounts from outside itself. A nil check refuses
 // every such mount.
@@ -23,8 +22,8 @@ type Checks struct {
 
 // volumeMount is one entry of x-site-deploy.volumes.
 type volumeMount struct {
-	name, key, service, target string
-	readOnly, snapshot         bool
+	name, service, target string
+	readOnly, snapshot    bool
 }
 
 // volumeMounts reads x-site-deploy.volumes, a mapping from volume names to
@@ -52,13 +51,13 @@ func volumeMounts(value any, service string) ([]volumeMount, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := allowedKeys(entry, where, "key target read_only snapshot service"); err != nil {
+		if _, exists := entry["key"]; exists {
+			return nil, fmt.Errorf("%s.key is no longer used: volumes are mounted by name since site-deploy 0.10.0; remove it", where)
+		}
+		if err := allowedKeys(entry, where, "target read_only snapshot service"); err != nil {
 			return nil, err
 		}
 		mount := volumeMount{name: name, service: service}
-		if mount.key, err = literalString(entry["key"], where+".key"); err != nil {
-			return nil, fmt.Errorf("%s.key must be the volume's key, a string as printed by site-deploy volume create", where)
-		}
 		if mount.target, err = literalString(entry["target"], where+".target"); err != nil {
 			return nil, err
 		}
@@ -117,7 +116,7 @@ func (v *validator) mountVolumes(mounts []volumeMount, check VolumeCheck) error 
 		return fmt.Errorf("x-site-deploy.volumes: this server has no site-deploy volumes; its operator enables them with serve --volumes-dir")
 	}
 	for _, mount := range mounts {
-		source, err := check(mount.name, mount.key, mount.snapshot)
+		source, err := check(mount.name, mount.snapshot)
 		if err != nil {
 			return fmt.Errorf("x-site-deploy.volumes.%s: %w", mount.name, err)
 		}

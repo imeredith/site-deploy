@@ -42,9 +42,8 @@ If it fails:
 | `site-deploy push LOCAL_IMAGE NAME:TAG` | Push a local dependencies image to the private registry. Prints the `image:` line to use |
 | `site-deploy images` | Registry contents, push times, and the apps using each image |
 | `site-deploy cleanup` | Remove unused registry tags and Docker images now (it also runs hourly and after each delete) |
-| `site-deploy volume list` | Site-deploy volumes, their snapshots, and the apps mounting each (daemon 0.9.0+). See "Shared data" |
-| `site-deploy volume create NAME` | Makes an empty volume and prints its path and key. **The key is shown only this once** |
-| `site-deploy volume rekey NAME` | Replaces the key and prints the new one. Deployed apps keep their mounts |
+| `site-deploy volume list` | Site-deploy volumes, their snapshots, and the apps mounting each (daemon 0.10.0+). See "Shared data" |
+| `site-deploy volume create NAME` | Makes an empty volume and prints its path. Bundles then mount it by name |
 | `site-deploy volume delete-snapshot NAME APP` | Deletes APP's snapshot, once APP itself is deleted |
 | `site-deploy volume delete NAME` | Deletes a volume no app mounts and with no snapshots left |
 | `site-deploy caddy-config --http` | The routing config site-deploy pushes to Caddy |
@@ -86,10 +85,10 @@ Because delete is destructive and visible to users, confirm with the user before
 
 ## Shared data: site-deploy volumes
 
-On a server started with `--volumes-dir` (daemon 0.9.0+), site-deploy volumes are btrfs directories that exist apart from any app. A bundle mounts one from `x-site-deploy.volumes` with the volume's key: either the volume itself, or, with `snapshot: true`, the app's own writable snapshot. `references/bundle-format.md` example 6 has the format. Prefer them over `--copy-volumes-from` for large datasets that many apps or previews start from: a snapshot is instant whatever the size, and it shares disk space until it changes.
+On a server started with `--volumes-dir` (daemon 0.10.0+), site-deploy volumes are btrfs directories that exist apart from any app. A bundle mounts one by name from `x-site-deploy.volumes`: either the volume itself, or, with `snapshot: true`, the app's own writable snapshot. `references/bundle-format.md` example 6 has the format. Prefer them over `--copy-volumes-from` for large datasets that many apps or previews start from: a snapshot is instant whatever the size, and it shares disk space until it changes.
 
 - **If `volume list` says volumes aren't enabled**, the server's operator has to add `--volumes-dir` on a btrfs filesystem (README, "Site-deploy volumes"). Tell the user rather than changing the server yourself.
-- **Keys:** `volume create` prints the key once. The bundle needs it, so give it to the user and put it where they want it (the compose file, or a CI secret written into it). A lost key means `volume rekey`, which leaves deployed apps mounted but makes every later deploy need the new key.
+- **No keys:** any bundle can mount any volume that exists. Daemon 0.9.0 needed a `key` per volume; 0.10.0 refuses one, so remove `key:` from bundles written for 0.9.0.
 - **Filling a volume** means writing to the path `volume create` printed, as root on the server, or deploying an app that mounts it read-write. Ask before doing either.
 - **Snapshots outlive their apps.** A snapshot is made on the app's first deploy, named after the app, and remounted by every redeploy under that name. `delete` keeps it. When a preview is finished, also run `volume delete-snapshot NAME APP`. To give a preview fresh data, delete it, delete its snapshot, and deploy again. Both discard the preview's changes, so confirm with the user first.
 - **Deletes are refused while in use:** a volume while any app mounts it or snapshots remain, a snapshot while its app is deployed.

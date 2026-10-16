@@ -71,9 +71,8 @@ Commands:
                                  Push a local Docker image to the daemon's private registry
   images                         List images in the private registry and the apps using them
   cleanup                        Remove unused registry tags and Docker images now
-  volume create NAME             Create a site-deploy volume and print its key, shown only once
+  volume create NAME             Create an empty site-deploy volume, which bundles mount by name
   volume list                    List volumes, their snapshots, and the apps mounting them
-  volume rekey NAME              Replace a volume's key and print the new one
   volume delete NAME             Delete a volume that no app mounts and that has no snapshots
   volume delete-snapshot NAME APP
                                  Delete APP's snapshot of a volume, once APP is deleted
@@ -341,13 +340,13 @@ func parse(args []string) (options, error) {
 
 // validVolumeCommand checks a volume subcommand and its arguments.
 func validVolumeCommand(args []string) error {
-	arguments := map[string]int{"create": 1, "list": 0, "rekey": 1, "delete": 1, "delete-snapshot": 2}
+	arguments := map[string]int{"create": 1, "list": 0, "delete": 1, "delete-snapshot": 2}
 	if len(args) == 0 {
-		return errors.New("volume expects create NAME, list, rekey NAME, delete NAME, or delete-snapshot NAME APP")
+		return errors.New("volume expects create NAME, list, delete NAME, or delete-snapshot NAME APP")
 	}
 	want, ok := arguments[args[0]]
 	if !ok || len(args) != want+1 {
-		return errors.New("volume expects create NAME, list, rekey NAME, delete NAME, or delete-snapshot NAME APP")
+		return errors.New("volume expects create NAME, list, delete NAME, or delete-snapshot NAME APP")
 	}
 	for i, name := range args[1:] {
 		if !store.ValidName(name) {
@@ -463,8 +462,6 @@ func runClient(opts *options, stdout, stderr io.Writer) error {
 		switch args[0] {
 		case "create":
 			path, method = path+"/"+args[1], http.MethodPost
-		case "rekey":
-			path, method = path+"/"+args[1]+"/rekey", http.MethodPost
 		case "delete":
 			path, method = path+"/"+args[1], http.MethodDelete
 		case "delete-snapshot":
@@ -541,8 +538,9 @@ func runClient(opts *options, stdout, stderr io.Writer) error {
 // copyVolumesVersion is the first daemon version with deploy --copy-volumes-from.
 const copyVolumesVersion = "0.7.0"
 
-// volumesVersion is the first daemon version with site-deploy volumes.
-const volumesVersion = "0.9.0"
+// volumesVersion is the first daemon version with site-deploy volumes mounted
+// by name. 0.9.0 had volumes that needed a key.
+const volumesVersion = "0.10.0"
 
 // requireDaemon fails unless the daemon is at least minimum, for features that
 // older daemons would silently ignore rather than refuse. Dev builds pass.
@@ -791,22 +789,13 @@ func printVolume(stdout io.Writer, args []string, data []byte) error {
 			fmt.Fprintf(table, "%s\t%s\t%s\t%s\n", diagnostic(volume.Name, ""), diagnostic(volume.Path, ""), orNone(snapshots), orNone(users))
 		}
 		return table.Flush()
-	case "create", "rekey":
-		var result struct {
-			Name string `json:"name"`
-			Path string `json:"path"`
-			Key  string `json:"key"`
+	case "create":
+		var volume volumes.Volume
+		if err := json.Unmarshal(data, &volume); err != nil || volume.Name == "" {
+			return errors.New("control API returned an invalid volume")
 		}
-		if err := json.Unmarshal(data, &result); err != nil || result.Name == "" || result.Key == "" {
-			return errors.New("control API returned an invalid volume key")
-		}
-		name, key := diagnostic(result.Name, ""), diagnostic(result.Key, "")
-		if args[0] == "create" {
-			fmt.Fprintf(stdout, "Created volume %s at %s\n", name, diagnostic(result.Path, ""))
-		} else {
-			fmt.Fprintf(stdout, "Replaced the key of volume %s. Deployed apps keep their mounts; deploying again needs the new key.\n", name)
-		}
-		_, err := fmt.Fprintf(stdout, "Key (shown only now): %s\nMount it from a bundle with:\n  x-site-deploy:\n    volumes:\n      %s:\n        key: %s\n        target: /data\n", key, name, key)
+		name := diagnostic(volume.Name, "")
+		_, err := fmt.Fprintf(stdout, "Created volume %s at %s\nMount it from a bundle with:\n  x-site-deploy:\n    volumes:\n      %s:\n        target: /data\n", name, diagnostic(volume.Path, ""), name)
 		return err
 	case "delete":
 		_, err := fmt.Fprintf(stdout, "Deleted volume %s\n", diagnostic(args[1], ""))

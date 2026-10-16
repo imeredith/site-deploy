@@ -14,12 +14,10 @@ const volumesBundle = `x-site-deploy:
   port: 8080
   volumes:
     corpus:
-      key: sdv_corpus-key
       target: /corpus/
       read_only: true
       snapshot: true
     cache:
-      key: sdv_cache-key
       target: /cache
       service: worker
 services:
@@ -32,8 +30,8 @@ services:
 `
 
 type volumeCall struct {
-	name, key string
-	snapshot  bool
+	name     string
+	snapshot bool
 }
 
 func TestPrepareMountsVolumesThatTheirCheckApproves(t *testing.T) {
@@ -42,20 +40,20 @@ func TestPrepareMountsVolumesThatTheirCheckApproves(t *testing.T) {
 		t.Fatal(err)
 	}
 	var calls []volumeCall
-	check := func(name, key string, snapshot bool) (string, error) {
-		calls = append(calls, volumeCall{name, key, snapshot})
+	check := func(name string, snapshot bool) (string, error) {
+		calls = append(calls, volumeCall{name, snapshot})
 		return "/srv/volumes/" + name + "/data", nil
 	}
 	_, filename, err := PrepareWith(root, Checks{Volume: check})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []volumeCall{{"cache", "sdv_cache-key", false}, {"corpus", "sdv_corpus-key", true}}; !reflect.DeepEqual(calls, want) {
+	if want := []volumeCall{{"cache", false}, {"corpus", true}}; !reflect.DeepEqual(calls, want) {
 		t.Fatalf("checks %+v; want %+v", calls, want)
 	}
 	doc := generated(t, filename)
 	if _, exists := doc["x-site-deploy"]; exists {
-		t.Fatal("the generated file keeps x-site-deploy, with its keys")
+		t.Fatal("the generated file keeps x-site-deploy")
 	}
 	services := doc["services"].(map[string]any)
 	web := services["web"].(map[string]any)["volumes"].([]any)
@@ -77,23 +75,23 @@ func TestPrepareMountsVolumesThatTheirCheckApproves(t *testing.T) {
 }
 
 func TestPrepareRejectsInvalidVolumesBeforeChecking(t *testing.T) {
-	approve := func(name, key string, snapshot bool) (string, error) {
+	approve := func(name string, snapshot bool) (string, error) {
 		t.Errorf("checked %s for an invalid bundle", name)
 		return "/srv/volumes/" + name + "/data", nil
 	}
 	for _, test := range []struct{ volumes, services, want string }{
-		{"    corpus: {target: /corpus}\n", "", "x-site-deploy.volumes.corpus.key must be the volume's key"},
-		{"    corpus: {key: 1234, target: /corpus}\n", "", "x-site-deploy.volumes.corpus.key must be the volume's key"},
-		{"    corpus: {key: k, target: corpus}\n", "", "x-site-deploy.volumes.corpus.target must be an absolute container path"},
-		{"    corpus: {key: k}\n", "", "x-site-deploy.volumes.corpus.target must be a nonempty string"},
-		{"    corpus: {key: k, target: /c, read_only: yes please}\n", "", "x-site-deploy.volumes.corpus.read_only must be a boolean"},
-		{"    corpus: {key: k, target: /c, snapshot: 1}\n", "", "x-site-deploy.volumes.corpus.snapshot must be a boolean"},
-		{"    corpus: {key: k, target: /c, subpath: x}\n", "", "x-site-deploy.volumes.corpus.subpath is not supported"},
-		{"    corpus: {key: k, target: /c, service: db}\n", "", `x-site-deploy.volumes.corpus.service "db" does not exist`},
-		{"    Corpus: {key: k, target: /c}\n", "", "x-site-deploy.volumes.Corpus: volume names start with a lowercase letter"},
-		{"    corpus: {key: k, target: /data}\n", "    volumes: [\"data:/data\"]\n", "x-site-deploy.volumes.corpus.target /data is already mounted in service web"},
-		{"    corpus: {key: k, target: /c}\n    other: {key: k, target: /c/}\n", "", "x-site-deploy.volumes.other.target /c is already mounted in service web"},
-		{"    corpus: {key: k, target: /c}\n", "    privileged: true\n", "privileged containers are not supported"},
+		{"    corpus: {key: sdv_x, target: /corpus}\n", "", "x-site-deploy.volumes.corpus.key is no longer used: volumes are mounted by name"},
+		{"    corpus: {target: corpus}\n", "", "x-site-deploy.volumes.corpus.target must be an absolute container path"},
+		{"    corpus: {read_only: true}\n", "", "x-site-deploy.volumes.corpus.target must be a nonempty string"},
+		{"    corpus: /corpus\n", "", "x-site-deploy.volumes.corpus must be a mapping"},
+		{"    corpus: {target: /c, read_only: yes please}\n", "", "x-site-deploy.volumes.corpus.read_only must be a boolean"},
+		{"    corpus: {target: /c, snapshot: 1}\n", "", "x-site-deploy.volumes.corpus.snapshot must be a boolean"},
+		{"    corpus: {target: /c, subpath: x}\n", "", "x-site-deploy.volumes.corpus.subpath is not supported"},
+		{"    corpus: {target: /c, service: db}\n", "", `x-site-deploy.volumes.corpus.service "db" does not exist`},
+		{"    Corpus: {target: /c}\n", "", "x-site-deploy.volumes.Corpus: volume names start with a lowercase letter"},
+		{"    corpus: {target: /data}\n", "    volumes: [\"data:/data\"]\n", "x-site-deploy.volumes.corpus.target /data is already mounted in service web"},
+		{"    corpus: {target: /c}\n    other: {target: /c/}\n", "", "x-site-deploy.volumes.other.target /c is already mounted in service web"},
+		{"    corpus: {target: /c}\n", "    privileged: true\n", "privileged containers are not supported"},
 		{"    {}\n", "", "x-site-deploy.volumes must map volume names to mounts"},
 	} {
 		compose := strings.Replace(basic, "  port: 8080\n", "  port: 8080\n  volumes:\n"+test.volumes, 1) + test.services
@@ -111,13 +109,13 @@ func TestPrepareRejectsInvalidVolumesBeforeChecking(t *testing.T) {
 }
 
 func TestPrepareVolumesNeedAServerThatHasThem(t *testing.T) {
-	compose := strings.Replace(basic, "  port: 8080\n", "  port: 8080\n  volumes:\n    corpus: {key: k, target: /corpus}\n", 1)
+	compose := strings.Replace(basic, "  port: 8080\n", "  port: 8080\n  volumes:\n    corpus: {target: /corpus}\n", 1)
 	if _, _, err := Prepare(project(t, compose), nil); err == nil || !strings.Contains(err.Error(), "serve --volumes-dir") {
 		t.Fatalf("without volumes: %v", err)
 	}
-	refuse := func(string, string, bool) (string, error) { return "", errors.New("wrong volume key for corpus") }
+	refuse := func(string, bool) (string, error) { return "", errors.New("volume not found: corpus") }
 	if _, _, err := PrepareWith(project(t, compose), Checks{Volume: refuse}); err == nil ||
-		!strings.Contains(err.Error(), "x-site-deploy.volumes.corpus: wrong volume key for corpus") || strings.Contains(err.Error(), "key: k") {
+		!strings.Contains(err.Error(), "x-site-deploy.volumes.corpus: volume not found: corpus") {
 		t.Fatalf("refused: %v", err)
 	}
 }

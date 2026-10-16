@@ -38,21 +38,12 @@ func (m *Manager) ListVolumes() ([]volumes.Volume, error) {
 	return list, nil
 }
 
-// CreateVolume makes an empty volume and returns it with its key, which only
-// this call reveals.
-func (m *Manager) CreateVolume(ctx context.Context, name string) (volumes.Volume, string, error) {
+// CreateVolume makes an empty volume.
+func (m *Manager) CreateVolume(ctx context.Context, name string) (volumes.Volume, error) {
 	if m.volumes == nil {
-		return volumes.Volume{}, "", ErrNoVolumes
+		return volumes.Volume{}, ErrNoVolumes
 	}
 	return m.volumes.Create(ctx, name)
-}
-
-// RekeyVolume replaces a volume's key and returns the new one.
-func (m *Manager) RekeyVolume(name string) (string, error) {
-	if m.volumes == nil {
-		return "", ErrNoVolumes
-	}
-	return m.volumes.Rekey(name)
 }
 
 // DeleteVolume removes a volume that no deployed application mounts and that

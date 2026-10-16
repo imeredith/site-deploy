@@ -17,7 +17,7 @@ import (
 )
 
 // sdVolumeBundle is a bundle whose web service mounts the site-deploy volume corpus at /corpus.
-func sdVolumeBundle(t *testing.T, domain, key string, snapshot bool) string {
+func sdVolumeBundle(t *testing.T, domain string, snapshot bool) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "app.zip")
 	file, err := os.Create(path)
@@ -33,8 +33,8 @@ func sdVolumeBundle(t *testing.T, domain, key string, snapshot bool) string {
 	if snapshot {
 		mode = "true"
 	}
-	config := "x-site-deploy:\n  domain: " + domain + "\n  service: web\n  port: 80\n  volumes:\n    corpus:\n      key: " + key +
-		"\n      target: /corpus\n      snapshot: " + mode + "\nservices:\n  web:\n    image: nginx:alpine\n"
+	config := "x-site-deploy:\n  domain: " + domain + "\n  service: web\n  port: 80\n  volumes:\n    corpus:\n" +
+		"      target: /corpus\n      snapshot: " + mode + "\nservices:\n  web:\n    image: nginx:alpine\n"
 	if _, err := entry.Write([]byte(config)); err != nil {
 		t.Fatal(err)
 	}
@@ -71,22 +71,21 @@ func TestVolumesMountSnapshotsThatRedeploysReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	_, key, err := m.CreateVolume(ctx, "corpus")
-	if err != nil {
+	if _, err := m.Deploy(ctx, "early", sdVolumeBundle(t, "early.localhost", true)); !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "volume not found: corpus") {
+		t.Fatalf("deploy before the volume exists: %v", err)
+	}
+	if _, err := m.CreateVolume(ctx, "corpus"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Deploy(ctx, "bad", sdVolumeBundle(t, "bad.localhost", volumes.KeyPrefix+strings.Repeat("0", 64), true)); !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "wrong volume key") {
-		t.Fatalf("deploy with a wrong key: %v", err)
-	}
-	if app, err := m.Deploy(ctx, "main", sdVolumeBundle(t, "main.localhost", key, false)); err != nil || app.State != model.StateRunning {
+	if app, err := m.Deploy(ctx, "main", sdVolumeBundle(t, "main.localhost", false)); err != nil || app.State != model.StateRunning {
 		t.Fatalf("deploy main: %+v %v", app, err)
 	}
-	if _, err := m.Deploy(ctx, "pr1", sdVolumeBundle(t, "pr1.localhost", key, true)); err != nil {
+	if _, err := m.Deploy(ctx, "pr1", sdVolumeBundle(t, "pr1.localhost", true)); err != nil {
 		t.Fatal(err)
 	}
 	snapshot := filepath.Join(dir, "corpus", "snapshots", "pr1")
 	compose, err := os.ReadFile(m.composePath("pr1"))
-	if err != nil || !strings.Contains(string(compose), `"source": "`+snapshot+`"`) || strings.Contains(string(compose), key) {
+	if err != nil || !strings.Contains(string(compose), `"source": "`+snapshot+`"`) {
 		t.Fatalf("pr1's Compose file:\n%s %v", compose, err)
 	}
 	list, err := m.ListVolumes()
@@ -110,7 +109,7 @@ func TestVolumesMountSnapshotsThatRedeploysReuse(t *testing.T) {
 	if err := m.Delete(ctx, "pr1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Deploy(ctx, "pr1", sdVolumeBundle(t, "pr1.localhost", key, true)); err != nil {
+	if _, err := m.Deploy(ctx, "pr1", sdVolumeBundle(t, "pr1.localhost", true)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(snapshot, "edited")); err != nil || fake.Snapshots() != 1 {
@@ -171,11 +170,10 @@ func TestVolumesAfterARestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, key, err := m.CreateVolume(context.Background(), "corpus")
-	if err != nil {
+	if _, err := m.CreateVolume(context.Background(), "corpus"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Deploy(context.Background(), "pr1", sdVolumeBundle(t, "pr1.localhost", key, true)); err != nil {
+	if _, err := m.Deploy(context.Background(), "pr1", sdVolumeBundle(t, "pr1.localhost", true)); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Close(); err != nil {
@@ -205,7 +203,7 @@ func TestVolumesAfterARestart(t *testing.T) {
 	if app, err := m.Get("pr1"); err != nil || app.State != model.StateError || !strings.Contains(app.Error, "not allowed") || runtime.suspends != 1 {
 		t.Fatalf("restart without volumes: %+v %v suspends=%d", app, err, runtime.suspends)
 	}
-	if _, err := m.Deploy(context.Background(), "pr2", sdVolumeBundle(t, "pr2.localhost", key, true)); !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "serve --volumes-dir") {
+	if _, err := m.Deploy(context.Background(), "pr2", sdVolumeBundle(t, "pr2.localhost", true)); !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "serve --volumes-dir") {
 		t.Fatalf("deploy without volumes: %v", err)
 	}
 	if _, err := m.ListVolumes(); !errors.Is(err, ErrNoVolumes) {

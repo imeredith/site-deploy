@@ -101,7 +101,7 @@ func TestSiteDeployVolumesOnBtrfs(t *testing.T) {
 		}
 	}()
 
-	created, key, err := m.CreateVolume(ctx, volume)
+	created, err := m.CreateVolume(ctx, volume)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,6 @@ func TestSiteDeployVolumesOnBtrfs(t *testing.T) {
   start_timeout: 60s
   volumes:
     %s:
-      key: %s
       target: /www
       read_only: %t
       snapshot: %t
@@ -128,7 +127,7 @@ services:
     image: %s
     init: true
     command: ["httpd", "-f", "-p", "8080", "-h", "/www"]
-`, app, volume, key, readOnly, snapshot, image)})
+`, app, volume, readOnly, snapshot, image)})
 		return path
 	}
 	get := func(app string) string {

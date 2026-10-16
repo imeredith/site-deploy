@@ -52,7 +52,7 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	registryAddr := flags.String("registry", "", "loopback address for the private image registry, such as 127.0.0.1:9082 (empty disables it)")
 	registryImage := flags.String("registry-image", "registry:3", "image that runs the private registry")
 	copyImage := flags.String("volume-copy-image", engine.DefaultCopyImage, "image that copies named volumes for deploy --copy-volumes-from (needs sh, find, and cp -a); it also runs the btrfs helper for --volumes-dir")
-	volumesDir := flags.String("volumes-dir", "", "btrfs directory for site-deploy volumes, which bundles mount, or mount snapshots of, with a key (empty disables them)")
+	volumesDir := flags.String("volumes-dir", "", "btrfs directory for site-deploy volumes, which bundles mount, or mount snapshots of, by name (empty disables them)")
 	registryGrace := flags.Duration("registry-grace", 24*time.Hour, "keep unused registry tags this long after their push")
 	pruneImages := flags.Bool("prune-images", false, "remove Docker images that no container uses (only on a host whose Docker is dedicated to site-deploy)")
 	cleanupInterval := flags.Duration("cleanup-interval", time.Hour, "how often to remove unused images")
@@ -304,7 +304,7 @@ func checkVolumesDir(dir, dataDir, dockerSocket string, hostPaths hostpaths.Poli
 		return fmt.Errorf("volumes-dir %s overlaps the Docker socket's directory %s", dir, socketDir)
 	}
 	if rule, found := hostPaths.Overlapping(dir); found {
-		return fmt.Errorf("host path %s overlaps volumes-dir %s, which would let apps mount volumes without their keys", rule.Path, dir)
+		return fmt.Errorf("host path %s overlaps volumes-dir %s, which would let apps mount other apps' snapshots and volume metadata", rule.Path, dir)
 	}
 	onBtrfs, err := btrfs.OnBtrfs(dir)
 	if err != nil {

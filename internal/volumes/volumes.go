@@ -1,12 +1,12 @@
 // Package volumes keeps site-deploy volumes: btrfs subvolumes that exist apart
-// from any deployment. A bundle that gives a volume's key can bind-mount the
-// volume itself, or its own snapshot of it. An application's snapshot is made on
-// its first deploy and kept, so redeploying the application mounts it again.
+// from any deployment. A bundle names a volume to bind-mount the volume itself,
+// or its own snapshot of it. An application's snapshot is made on its first
+// deploy and kept, so redeploying the application mounts it again.
 //
 //	DIR/
 //	  .lock
 //	  NAME/
-//	    volume.json       the key's SHA-256 and the creation time
+//	    volume.json       the creation time; written last, so it marks a complete volume
 //	    data/             subvolume: the volume
 //	    snapshots/APP/    subvolume: APP's snapshot of data
 //
@@ -15,10 +15,6 @@ package volumes
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,7 +33,6 @@ import (
 var (
 	ErrNotFound = errors.New("volume not found")
 	ErrExists   = errors.New("volume already exists")
-	ErrKey      = errors.New("wrong volume key")
 	ErrInUse    = errors.New("volume is in use")
 )
 
@@ -51,7 +46,7 @@ type Subvolumes interface {
 	IsSubvolume(path string) (bool, error)
 }
 
-// Volume describes a volume for the API. Keys are never included.
+// Volume describes a volume for the API.
 type Volume struct {
 	Name      string     `json:"name"`
 	Path      string     `json:"path"`
@@ -74,9 +69,10 @@ type Use struct {
 	Snapshot bool   `json:"snapshot"`
 }
 
+// metadata is volume.json. Volumes made by 0.9.0 also hold a key_sha256,
+// which is no longer used.
 type metadata struct {
-	KeySHA256 string    `json:"key_sha256"`
-	Created   time.Time `json:"created"`
+	Created time.Time `json:"created"`
 }
 
 const metadataFile = "volume.json"
@@ -134,11 +130,10 @@ func (s *Store) snapshotPath(name, app string) string {
 	return filepath.Join(s.dir, name, "snapshots", app)
 }
 
-// Create makes an empty volume and returns it with its key. Only the key's
-// hash is stored, so this is the only time the key is available.
-func (s *Store) Create(ctx context.Context, name string) (Volume, string, error) {
+// Create makes an empty volume.
+func (s *Store) Create(ctx context.Context, name string) (Volume, error) {
 	if !store.ValidName(name) {
-		return Volume{}, "", invalidName(name)
+		return Volume{}, invalidName(name)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -146,11 +141,11 @@ func (s *Store) Create(ctx context.Context, name string) (Volume, string, error)
 	if err := os.Mkdir(dir, 0700); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			if _, loadErr := s.load(name); errors.Is(loadErr, ErrNotFound) {
-				return Volume{}, "", fmt.Errorf("%w: %s holds an incomplete volume, left by an interrupted create; delete it first", ErrExists, name)
+				return Volume{}, fmt.Errorf("%w: %s holds an incomplete volume, left by an interrupted create; delete it first", ErrExists, name)
 			}
-			return Volume{}, "", fmt.Errorf("%w: %s", ErrExists, name)
+			return Volume{}, fmt.Errorf("%w: %s", ErrExists, name)
 		}
-		return Volume{}, "", err
+		return Volume{}, err
 	}
 	created := false
 	defer func() {
@@ -164,42 +159,17 @@ func (s *Store) Create(ctx context.Context, name string) (Volume, string, error)
 		}
 	}()
 	if err := os.Mkdir(filepath.Join(dir, "snapshots"), 0700); err != nil {
-		return Volume{}, "", err
+		return Volume{}, err
 	}
 	if err := s.subvolumes.Create(ctx, s.dataPath(name)); err != nil {
-		return Volume{}, "", err
+		return Volume{}, err
 	}
-	key, meta, err := newKey(time.Now().UTC())
-	if err != nil {
-		return Volume{}, "", err
-	}
+	meta := metadata{Created: time.Now().UTC()}
 	if err := s.save(name, meta); err != nil {
-		return Volume{}, "", err
+		return Volume{}, err
 	}
 	created = true
-	return Volume{Name: name, Path: s.dataPath(name), Created: meta.Created, Snapshots: []Snapshot{}, UsedBy: []Use{}}, key, nil
-}
-
-// Rekey replaces a volume's key and returns the new one. Deployed applications
-// keep their mounts; deploying again needs the new key.
-func (s *Store) Rekey(name string) (string, error) {
-	if !store.ValidName(name) {
-		return "", invalidName(name)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	meta, err := s.load(name)
-	if err != nil {
-		return "", err
-	}
-	key, fresh, err := newKey(meta.Created)
-	if err != nil {
-		return "", err
-	}
-	if err := s.save(name, fresh); err != nil {
-		return "", err
-	}
-	return key, nil
+	return Volume{Name: name, Path: s.dataPath(name), Created: meta.Created, Snapshots: []Snapshot{}, UsedBy: []Use{}}, nil
 }
 
 // List returns every complete volume with its snapshots, sorted by name.
@@ -238,10 +208,10 @@ func (s *Store) List() ([]Volume, error) {
 	return volumes, nil
 }
 
-// Source checks key and returns the host path that app bind-mounts: the
-// volume, or with snapshot, app's snapshot of it. app's first deploy makes the
-// snapshot; later deploys mount the same one.
-func (s *Store) Source(ctx context.Context, name, key, app string, snapshot bool) (string, error) {
+// Source returns the host path that app bind-mounts: the volume, or with
+// snapshot, app's snapshot of it. app's first deploy makes the snapshot; later
+// deploys mount the same one.
+func (s *Store) Source(ctx context.Context, name, app string, snapshot bool) (string, error) {
 	if !store.ValidName(name) {
 		return "", invalidName(name)
 	}
@@ -250,17 +220,8 @@ func (s *Store) Source(ctx context.Context, name, key, app string, snapshot bool
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	meta, err := s.load(name)
-	if err != nil {
+	if _, err := s.load(name); err != nil {
 		return "", err
-	}
-	want, err := hex.DecodeString(meta.KeySHA256)
-	if err != nil || len(want) != sha256.Size {
-		return "", fmt.Errorf("volume %s has an invalid stored key hash", name)
-	}
-	got := sha256.Sum256([]byte(key))
-	if subtle.ConstantTimeCompare(want, got[:]) != 1 {
-		return "", fmt.Errorf("%w for %s", ErrKey, name)
 	}
 	data := s.dataPath(name)
 	if err := s.checkSubvolume(data); err != nil {
@@ -303,8 +264,7 @@ func (s *Store) Locate(path string) (name, snapshotApp string, ok bool) {
 }
 
 // Check confirms, before a start, that source is still a volume app may
-// mount: the volume's data, or app's own snapshot, as a real subvolume. The
-// key was checked when app was deployed.
+// mount: the volume's data, or app's own snapshot, as a real subvolume.
 func (s *Store) Check(app, source string) error {
 	name, snapshotApp, ok := s.Locate(source)
 	if !ok {
@@ -449,22 +409,6 @@ func (s *Store) save(name string, meta metadata) error {
 	}
 	defer parent.Close()
 	return parent.Sync()
-}
-
-// KeyPrefix starts every key. Besides naming what the key is for, it keeps
-// YAML from reading a key that happens to be all digits as a number.
-const KeyPrefix = "sdv_"
-
-// newKey returns a random 256-bit key, hex encoded after KeyPrefix, and its
-// metadata.
-func newKey(created time.Time) (string, metadata, error) {
-	var entropy [32]byte
-	if _, err := rand.Read(entropy[:]); err != nil {
-		return "", metadata{}, err
-	}
-	key := KeyPrefix + hex.EncodeToString(entropy[:])
-	hash := sha256.Sum256([]byte(key))
-	return key, metadata{KeySHA256: hex.EncodeToString(hash[:]), Created: created}, nil
 }
 
 func invalidName(name string) error {

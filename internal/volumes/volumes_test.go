@@ -27,30 +27,26 @@ func open(t *testing.T) (*Store, *volumestest.Subvolumes, string) {
 	return s, fake, dir
 }
 
-func TestCreateStoresOnlyTheKeyHash(t *testing.T) {
+func TestCreateMakesAnEmptyVolume(t *testing.T) {
 	s, _, dir := open(t)
-	volume, key, err := s.Create(context.Background(), "corpus")
+	volume, err := s.Create(context.Background(), "corpus")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(key, KeyPrefix) || len(key) != len(KeyPrefix)+64 {
-		t.Fatalf("key %q", key)
-	}
 	if volume.Name != "corpus" || volume.Path != filepath.Join(dir, "corpus", "data") || volume.Created.IsZero() {
 		t.Fatalf("volume %+v", volume)
+	}
+	if entries, err := os.ReadDir(volume.Path); err != nil || len(entries) != 0 {
+		t.Fatalf("data: %v %v", entries, err)
 	}
 	info, err := os.Stat(filepath.Join(dir, "corpus", "volume.json"))
 	if err != nil || info.Mode().Perm() != 0600 {
 		t.Fatalf("volume.json: %v %v", info, err)
 	}
-	data, err := os.ReadFile(filepath.Join(dir, "corpus", "volume.json"))
-	if err != nil || strings.Contains(string(data), key) || strings.Contains(string(data), strings.TrimPrefix(key, KeyPrefix)) {
-		t.Fatalf("volume.json holds the key: %s %v", data, err)
-	}
-	if _, _, err := s.Create(context.Background(), "corpus"); !errors.Is(err, ErrExists) {
+	if _, err := s.Create(context.Background(), "corpus"); !errors.Is(err, ErrExists) {
 		t.Fatalf("second create: %v", err)
 	}
-	if _, _, err := s.Create(context.Background(), "Corpus"); err == nil {
+	if _, err := s.Create(context.Background(), "Corpus"); err == nil {
 		t.Fatal("accepted an invalid name")
 	}
 	// A second daemon can't use the same directory.
@@ -62,7 +58,7 @@ func TestCreateStoresOnlyTheKeyHash(t *testing.T) {
 func TestFailedCreateLeavesNothing(t *testing.T) {
 	s, fake, dir := open(t)
 	fake.Fail = volumestest.ErrInjected
-	if _, _, err := s.Create(context.Background(), "corpus"); !errors.Is(err, volumestest.ErrInjected) {
+	if _, err := s.Create(context.Background(), "corpus"); !errors.Is(err, volumestest.ErrInjected) {
 		t.Fatalf("create: %v", err)
 	}
 	if _, err := os.Lstat(filepath.Join(dir, "corpus")); !os.IsNotExist(err) {
@@ -73,7 +69,7 @@ func TestFailedCreateLeavesNothing(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "partial"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.Create(context.Background(), "partial"); !errors.Is(err, ErrExists) || !strings.Contains(err.Error(), "incomplete") {
+	if _, err := s.Create(context.Background(), "partial"); !errors.Is(err, ErrExists) || !strings.Contains(err.Error(), "incomplete") {
 		t.Fatalf("create over partial: %v", err)
 	}
 	if list, err := s.List(); err != nil || len(list) != 0 {
@@ -82,46 +78,45 @@ func TestFailedCreateLeavesNothing(t *testing.T) {
 	if err := s.Delete(context.Background(), "partial"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.Create(context.Background(), "partial"); err != nil {
+	if _, err := s.Create(context.Background(), "partial"); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestSourceChecksTheKeyAndKeepsEachAppsSnapshot(t *testing.T) {
+func TestSourceKeepsEachAppsSnapshot(t *testing.T) {
 	s, fake, dir := open(t)
 	ctx := context.Background()
-	_, key, err := s.Create(ctx, "corpus")
-	if err != nil {
+	if _, err := s.Create(ctx, "corpus"); err != nil {
 		t.Fatal(err)
 	}
 	data := filepath.Join(dir, "corpus", "data")
 	if err := os.WriteFile(filepath.Join(data, "page"), []byte("master"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Source(ctx, "corpus", KeyPrefix+strings.Repeat("0", 64), "main", false); !errors.Is(err, ErrKey) {
-		t.Fatalf("wrong key: %v", err)
-	}
-	if _, err := s.Source(ctx, "missing", key, "main", false); !errors.Is(err, ErrNotFound) {
+	if _, err := s.Source(ctx, "missing", "main", false); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing volume: %v", err)
 	}
-	if source, err := s.Source(ctx, "corpus", key, "main", false); err != nil || source != data {
+	if source, err := s.Source(ctx, "corpus", "main", false); err != nil || source != data {
 		t.Fatalf("direct source %q %v", source, err)
 	}
 	snapshot := filepath.Join(dir, "corpus", "snapshots", "pr1")
-	if source, err := s.Source(ctx, "corpus", key, "pr1", true); err != nil || source != snapshot {
+	if source, err := s.Source(ctx, "corpus", "pr1", true); err != nil || source != snapshot {
 		t.Fatalf("snapshot source %q %v", source, err)
 	}
 	if err := os.WriteFile(filepath.Join(snapshot, "page"), []byte("changed"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	// A redeploy mounts the same snapshot, with its changes, without a new one.
-	if source, err := s.Source(ctx, "corpus", key, "pr1", true); err != nil || source != snapshot || fake.Snapshots() != 1 {
+	if source, err := s.Source(ctx, "corpus", "pr1", true); err != nil || source != snapshot || fake.Snapshots() != 1 {
 		t.Fatalf("second snapshot source %q %v, %d snapshots", source, err, fake.Snapshots())
 	}
 	if page, _ := os.ReadFile(filepath.Join(snapshot, "page")); string(page) != "changed" {
 		t.Fatalf("snapshot reset: %q", page)
 	}
-	if _, err := s.Source(ctx, "corpus", key, "pr2", true); err != nil || fake.Snapshots() != 2 {
+	if page, _ := os.ReadFile(filepath.Join(data, "page")); string(page) != "master" {
+		t.Fatalf("volume changed with its snapshot: %q", page)
+	}
+	if _, err := s.Source(ctx, "corpus", "pr2", true); err != nil || fake.Snapshots() != 2 {
 		t.Fatalf("second app: %v, %d snapshots", err, fake.Snapshots())
 	}
 	list, err := s.List()
@@ -132,29 +127,36 @@ func TestSourceChecksTheKeyAndKeepsEachAppsSnapshot(t *testing.T) {
 	if !reflect.DeepEqual(list[0].Snapshots, want) {
 		t.Fatalf("snapshots %+v", list[0].Snapshots)
 	}
+}
 
-	// After a rekey only the new key works.
-	fresh, err := s.Rekey("corpus")
-	if err != nil || fresh == key {
-		t.Fatalf("rekey %v", err)
+func TestVolumesMadeBy090StillWork(t *testing.T) {
+	s, _, dir := open(t)
+	ctx := context.Background()
+	if _, err := s.Create(ctx, "corpus"); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := s.Source(ctx, "corpus", key, "main", false); !errors.Is(err, ErrKey) {
-		t.Fatalf("old key after rekey: %v", err)
+	// 0.9.0 also stored the hash of a key, which nothing checks any more.
+	old := `{"key_sha256":"0d7e5a1c3e3b1f4e9a2b6c8d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b","created":"2026-10-16T00:49:30Z"}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "corpus", "volume.json"), []byte(old), 0600); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := s.Source(ctx, "corpus", fresh, "main", false); err != nil {
-		t.Fatalf("new key: %v", err)
+	list, err := s.List()
+	if err != nil || len(list) != 1 || list[0].Created.Format("2006-01-02") != "2026-10-16" {
+		t.Fatalf("list %+v %v", list, err)
+	}
+	if _, err := s.Source(ctx, "corpus", "pr1", true); err != nil {
+		t.Fatal(err)
 	}
 }
 
 func TestCheckAllowsOnlyRealVolumesAndOwnSnapshots(t *testing.T) {
 	s, _, dir := open(t)
 	ctx := context.Background()
-	_, key, err := s.Create(ctx, "corpus")
-	if err != nil {
+	if _, err := s.Create(ctx, "corpus"); err != nil {
 		t.Fatal(err)
 	}
 	data := filepath.Join(dir, "corpus", "data")
-	snapshot, err := s.Source(ctx, "corpus", key, "pr1", true)
+	snapshot, err := s.Source(ctx, "corpus", "pr1", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,11 +202,10 @@ func TestCheckAllowsOnlyRealVolumesAndOwnSnapshots(t *testing.T) {
 func TestDeleteRefusesWhileSnapshotsRemain(t *testing.T) {
 	s, _, dir := open(t)
 	ctx := context.Background()
-	_, key, err := s.Create(ctx, "corpus")
-	if err != nil {
+	if _, err := s.Create(ctx, "corpus"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Source(ctx, "corpus", key, "pr1", true); err != nil {
+	if _, err := s.Source(ctx, "corpus", "pr1", true); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Delete(ctx, "corpus"); !errors.Is(err, ErrInUse) || !strings.Contains(err.Error(), "pr1") {

@@ -374,8 +374,8 @@ func (m *Manager) DeployWith(ctx context.Context, name, zipPath string, opts Dep
 		return m.hostPaths.Check(name, source, readOnly)
 	}}
 	if m.volumes != nil {
-		checks.Volume = func(volume, key string, snapshot bool) (string, error) {
-			return m.volumes.Source(ctx, volume, key, name, snapshot)
+		checks.Volume = func(volume string, snapshot bool) (string, error) {
+			return m.volumes.Source(ctx, volume, name, snapshot)
 		}
 	}
 	spec, generated, err := manifest.PrepareWith(staging, checks)

@@ -323,8 +323,8 @@ func (h *handler) delete(w http.ResponseWriter, r *http.Request, name string) {
 	h.json(w, http.StatusOK, map[string]string{"deleted": name})
 }
 
-// volume serves /v1/volumes/NAME (POST creates, DELETE deletes),
-// /v1/volumes/NAME/rekey (POST), and /v1/volumes/NAME/snapshots/APP (DELETE).
+// volume serves /v1/volumes/NAME (POST creates, DELETE deletes) and
+// /v1/volumes/NAME/snapshots/APP (DELETE).
 func (h *handler) volume(w http.ResponseWriter, r *http.Request, parts []string) {
 	if _, err := query(r); err != nil {
 		h.error(w, http.StatusBadRequest, err)
@@ -344,16 +344,13 @@ func (h *handler) volume(w http.ResponseWriter, r *http.Request, parts []string)
 	case len(parts) == 1:
 		switch r.Method {
 		case http.MethodPost:
-			volume, key, err := h.manager.CreateVolume(r.Context(), name)
+			volume, err := h.manager.CreateVolume(r.Context(), name)
 			if err != nil {
 				h.error(w, errorStatus(err), err)
 				return
 			}
 			w.Header().Set("Location", "/v1/volumes/"+name)
-			h.json(w, http.StatusCreated, struct {
-				volumes.Volume
-				Key string `json:"key"`
-			}{volume, key})
+			h.json(w, http.StatusCreated, volume)
 		case http.MethodDelete:
 			ctx, cancel := deleteContext()
 			defer cancel()
@@ -364,15 +361,6 @@ func (h *handler) volume(w http.ResponseWriter, r *http.Request, parts []string)
 			h.json(w, http.StatusOK, map[string]string{"deleted": name})
 		default:
 			h.method(w, r, http.MethodPost, http.MethodDelete)
-		}
-	case len(parts) == 2 && parts[1] == "rekey":
-		if h.method(w, r, http.MethodPost) {
-			key, err := h.manager.RekeyVolume(name)
-			if err != nil {
-				h.error(w, errorStatus(err), err)
-				return
-			}
-			h.json(w, http.StatusOK, map[string]string{"name": name, "key": key})
 		}
 	case len(parts) == 3 && parts[1] == "snapshots" && parts[2] != "":
 		app := parts[2]
@@ -537,7 +525,7 @@ func errorStatus(err error) int {
 		return http.StatusConflict
 	case errors.Is(err, orchestrator.ErrUnavailable):
 		return http.StatusServiceUnavailable
-	case errors.Is(err, orchestrator.ErrInvalid), errors.Is(err, volumes.ErrKey):
+	case errors.Is(err, orchestrator.ErrInvalid):
 		return http.StatusBadRequest
 	case errors.Is(err, context.DeadlineExceeded):
 		return http.StatusGatewayTimeout
